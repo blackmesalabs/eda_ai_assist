@@ -142,14 +142,15 @@ class api_eda_ai_assist:
         site_prompt = self.load_site_prompt()
         custom_prompt = "\n".join( p for p in [site_prompt, prompt] if p )
 
-        full_prompt     = self.build_ai_prompt(custom_prompt, input_file_list)
+#       full_prompt     = self.build_ai_prompt(custom_prompt, input_file_list)
+        full_prompt     = custom_prompt
 
         # Check for really large prompts and ask permission to proceed
-        if full_prompt and not self.warn_if_large(full_prompt): 
-            print("Aborted by user.") 
-            return
-        print("Model = %s" % model )
-        print( full_prompt )
+#       if full_prompt and not self.warn_if_large(full_prompt): 
+#           print("Aborted by user.") 
+#           return
+#       print("Model = %s" % model )
+#       print( full_prompt )
 
         response_text = "Fake Response"
         upload_bytes = len(full_prompt.encode("utf-8"))
@@ -168,7 +169,7 @@ class api_eda_ai_assist:
 
 #       ai_engine = ai_engine.lower();
 #       result = self.ask_ai_model( prompt, ai_engine, api_key )
-        result = self.ask_ai_model( prompt, provider_info )
+        result = self.ask_ai_model( prompt, provider_info, input_file_list )
 
         if output_file:
             try:
@@ -184,23 +185,40 @@ class api_eda_ai_assist:
         else:
             print(result)
 
-    def ask_ai_model( self, prompt, provider_info ):
+    def ask_ai_model( self, prompt, provider_info, input_file_list ):
         if provider_info["provider"] == "gemini":
-            return self.ask_gemini(prompt, provider_info["key"], provider_info["model"] )
+            return self.ask_gemini(prompt, provider_info["key"], provider_info["model"], input_file_list )
         else:
             return f"Unknown ai_engine: {provider_info['provider']}"
 
-    def ask_gemini(self, prompt, api_key, model ):
+    def ask_gemini(self, prompt, api_key, model, input_file_list ):
         from google import genai
+
         # If api_key is None, the client auto‑reads GEMINI_API_KEY
 #       client = genai.Client() if api_key is None else genai.Client(api_key=api_key)
         if api_key:
             client = genai.Client(api_key=api_key)
         else:
             client = genai.Client()  # auto-reads GEMINI_API_KEY
+        
+        # 1. Upload each file using the Files API
+        uploaded_files = []
+        for each_file in input_file_list:
+#           uploaded_file = client.files.upload(file=each_file, mime_type='text/plain')
+            uploaded_file = client.files.upload(file=each_file)
+            uploaded_files.append(uploaded_file)
+            print(f"Uploaded file '{each_file}' as: {uploaded_file.name}")
+
+        # 2. Create the contents list for the prompt
+        # It's important to add descriptive text to help the model distinguish between files
+        contents = []
+        for i, file in enumerate(uploaded_files):
+            contents.append(f"Content of File {i+1} ({os.path.basename(input_file_list[i])}):")
+            contents.append(file)
+        contents.append(prompt)
 
         try:
-            response = client.models.generate_content( model=model, contents=prompt)
+            response = client.models.generate_content( model=model, contents=contents)
 #           response = client.models.generate_content( model="gemini-2.5-flash", contents=prompt)
 #           response = client.models.generate_content( model="gemini-2.5-flash-lite", contents=prompt)
             return response.text.strip()
