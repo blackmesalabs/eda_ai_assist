@@ -1,5 +1,5 @@
 # eda_ai_assist
-AI assisted Shell, aka "Ash". Wraps around your existing shell and brings AI-LLM to the CLI for analyzing EDA files.
+Ash (AI‑Assisted Shell) wraps around your existing terminal and brings modern AI/LLM capabilities directly to the command line for analyzing EDA files.
 
 # Ash CLI Assistant
 
@@ -13,6 +13,7 @@ Ash is a command‑line AI assistant designed for hardware engineers who work wi
 - Provider abstraction (currently Gemini)
 - Structured usage logging and per-user accounting
 - Predictable, auditable behavior
+- Works offline except for model calls
 
 ## Installation
 Clone the repository and install dependencies:
@@ -112,6 +113,8 @@ export ASH_DIR="$HOME/.ash"
 export ASH_API_KEY="mykey123"
 export ASH_PROVIDER="gemini"
 export ASH_MODEL="gemini-2.0-pro"
+# Add a convenient 'ash' command
+alias ash="$ASH_DIR/eda_ai_assist.py"
 ```
 
 ### CSH / TCSH
@@ -121,7 +124,15 @@ setenv ASH_DIR "$HOME/.ash"
 setenv ASH_API_KEY "mykey123"
 setenv ASH_PROVIDER "gemini"
 setenv ASH_MODEL "gemini-2.0-pro"
+# Add a convenient 'ash' command
+alias ash "$ASH_DIR/eda_ai_assist.py"
 ```
+
+### Make sure the script is executable:
+```
+chmod +x $HOME/.ash/eda_ai_assist.py
+```
+
 
 
 ## Usage
