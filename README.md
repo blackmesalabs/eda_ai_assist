@@ -55,6 +55,75 @@ Ash defaults to Gemini but is designed to support additional providers such as A
 export ASH_PROVIDER="gemini"
 ```
 
+
+# Cross‑Platform Setup (Windows + Linux)
+
+Ash stores its configuration in a per‑user directory called **ASH_DIR**.  
+For single‑user installs, the recommended locations are:
+
+- **Linux:** `$HOME/.ash`  
+- **Windows:** `%USERPROFILE%\.ash`
+
+Below are example setups for both environments.
+
+---
+
+## Windows Setup (ash.bat)
+
+Copy `eda_ai_assist.py` into:
+
+```
+%USERPROFILE%\.ash
+```
+
+Example `ash.bat`:
+
+```bat
+@echo off
+REM Configure Ash for a single-user Windows install
+setx ASH_DIR "%USERPROFILE%\.ash"
+setx ASH_API_KEY "mykey123"
+setx ASH_PROVIDER "gemini"
+setx ASH_MODEL "gemini-2.0-pro"
+
+REM Execute the assistant from the configured directory
+python "%USERPROFILE%\.ash\eda_ai_assist.py"
+```
+
+This script works when launched from **CMD or PowerShell**, because:
+- `setx` writes variables to the Windows user environment (visible to both shells)
+- `%USERPROFILE%` expands correctly inside `.bat` files
+- No shell‑specific syntax is used inside the Python command
+
+---
+
+## Linux Setup
+
+Add the following to your shell startup file (`~/.bashrc`, `~/.zshrc`, or `~/.cshrc`) when installing into:
+
+```
+$HOME/.ash
+```
+
+### Bash / Zsh
+
+```bash
+export ASH_DIR="$HOME/.ash"
+export ASH_API_KEY="mykey123"
+export ASH_PROVIDER="gemini"
+export ASH_MODEL="gemini-2.0-pro"
+```
+
+### CSH / TCSH
+
+```csh
+setenv ASH_DIR "$HOME/.ash"
+setenv ASH_API_KEY "mykey123"
+setenv ASH_PROVIDER "gemini"
+setenv ASH_MODEL "gemini-2.0-pro"
+```
+
+
 ## Usage
 Run Ash with a prompt:
 
