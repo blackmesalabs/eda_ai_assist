@@ -27,19 +27,19 @@ Ensure the `google-genai` package is installed for Gemini support.
 ## API Key Configuration
 Ash supports three ways to provide credentials. They are evaluated in the following order:
 
-### 1. ASH_GEMINI_TOKEN (Encrypted Token)
+### 1. ASH_TOKEN (Encrypted Token)
 A secure, multi-user-safe encrypted token. This token is bound to a username and protected with an HMAC signature. It requires a site secret key to decrypt.
 
 Environment variable:
 ```
-export ASH_GEMINI_TOKEN="username|cipher|signature"
+export ASH_TOKEN="username|cipher|signature"
 ```
 
-### 2. ASH_GEMINI_API_KEY (Raw API Key)
+### 2. ASH_API_KEY (Raw API Key)
 A simple raw API key for single-user environments. Overrides the encrypted token if both are present.
 
 ```
-export ASH_GEMINI_API_KEY="your-api-key"
+export ASH_API_KEY="your-api-key"
 ```
 
 ### 3. GEMINI_API_KEY (SDK Fallback)
@@ -85,7 +85,7 @@ REM Configure Ash for a single-user Windows install
 setx ASH_DIR "%USERPROFILE%\.ash"
 setx ASH_API_KEY "mykey123"
 setx ASH_PROVIDER "gemini"
-setx ASH_MODEL "gemini-2.0-pro"
+setx ASH_MODEL "gemini-2.5-flash"
 
 REM Execute the assistant from the configured directory
 python "%USERPROFILE%\.ash\eda_ai_assist.py"
@@ -112,7 +112,7 @@ $HOME/.ash
 export ASH_DIR="$HOME/.ash"
 export ASH_API_KEY="mykey123"
 export ASH_PROVIDER="gemini"
-export ASH_MODEL="gemini-2.0-pro"
+export ASH_MODEL="gemini-2.5-flash"
 # Add a convenient 'ash' command
 alias ash="$ASH_DIR/eda_ai_assist.py"
 ```
@@ -123,7 +123,7 @@ alias ash="$ASH_DIR/eda_ai_assist.py"
 setenv ASH_DIR "$HOME/.ash"
 setenv ASH_API_KEY "mykey123"
 setenv ASH_PROVIDER "gemini"
-setenv ASH_MODEL "gemini-2.0-pro"
+setenv ASH_MODEL "gemini-2.5-flash"
 # Add a convenient 'ash' command
 alias ash "$ASH_DIR/eda_ai_assist.py"
 ```

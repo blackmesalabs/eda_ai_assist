@@ -40,17 +40,19 @@
 #######################################
 # Linux / macOS
 #  export ASH_API_KEY="mykey123"
-#  export ASH_MODEL="gemini-2.0-pro"
+#  export ASH_MODEL="gemini-2.5-flash"
 #  export ASH_PROVIDER="gemini"
 #  export ASH_DIR="$HOME/.ash"
-#  export ASH_USER_PROMPT="Address me as Sir Kevin."
-# Windows (PowerShell)
+#  export ASH_USER_PROMPT="Please address me as Ser Kevin."
+# Windows (PowerShell) ash.bat file
 #  setx ASH_API_KEY "mykey123"
-#  setx ASH_MODEL "gemini-2.0-pro"
+#  setx ASH_MODEL "gemini-2.5-pro"
 #  setx ASH_DIR "C:\Users\Kevin\.ash\logs"
 #
 # History:
-#  2026.02.07 : Created, forked from original sump_ai.py. Added CLI
+#  2026.02.07 : khubbard : Created, forked from original sump_ai.py. Added CLI
+#  2026.02.11 : khubbard : Added paste buffer with threading timeout.
+#  2026.02.15 : khubbard : Refactoring. Started to add Azure support (incomplete)
 #
 # TODO: Consider replacing os.getlogin with getpass.getuser()
 ########################################################################
@@ -65,7 +67,7 @@ Features:
 - Prompt shows current working directory
 - Executes commands through the detected shell
 - Intercepts `cd` (changes wrapper's working directory)
-- Handles exit/quit, Ctrl+C, and Ctrl+D
+- Handles exit/quit, Ctrl+C
 - Persistent command history saved to ~/.shell_wrapper_history
 - Tab completion:
     * POSIX: readline-based completion for files/dirs and executables on PATH
@@ -86,12 +88,18 @@ import shlex
 import glob
 import re
 from typing import Optional, Literal, Tuple, List
+import time, os
+
+# 32‑bit UNIX timestamp (hex)+ 16‑bit CPU PID (hex)+ Original filename
+ASH_FILE_RE = re.compile(r"^[0-9a-fA-F]{8}_[0-9a-fA-F]{4}_.+$")
 
 # ---------- Config ----------
 PROMPT_COLOR = "\033[36m"
 RESET_COLOR = "\033[0m"
 HISTORY_FILE = os.path.expanduser("~/.shell_wrapper_history")
 HISTORY_LIMIT = 5000
+CTRL_G = "\x07"
+CTRL_N = "\x0e"
 
 ShellType = Literal["powershell", "csh"]
 
@@ -105,36 +113,166 @@ _readline_available = False
 _history_loaded = False
 _win_completion_active = False
 
-
 class api_eda_ai_assist:
-    def is_ai_request(self, prompt):
-        import string;
-        # Removed "which" as this is a Linux command
-        AI_TRIGGERS = { "how", "why", "what", "when", "where", "who", "explain",
-                    "describe", "tell", "show", "help", "analyze", "interpret",
-                    "summarize", "compare", "count", "find", "identify", "measure",
-                    "detect", "decode", "please", "can", "could", "would","examine",
-                    "ash" }
-        tokens = [t.strip(string.punctuation) for t in prompt.lower().split()]
-        return any(t in AI_TRIGGERS for t in tokens)
+    def __init__(self):
+        self.provider = None
+        self.cfg = None
+        self.debug = False
 
-
-    def ask_ai(self, prompt, ai_engine="gemini", api_key=None):
-#       api_key, model, user_prompt, logdir = self.get_env_config()
-        user_prompt, logdir = self.get_env_config()
-
-#       self.get_provider_config()
-#           return {
-#               "provider": "gemini",
-#               "key": key,
-#               "endpoint": "https://generativelanguage.googleapis.com/v1beta/openai",
-#               "model": os.getenv("ASH_MODEL", "gemini-2.0-flash"),
-#           }
-
+    def open_ai_session( self ):
+        if self.debug:
+          print("open_ai_session")
         provider_info = self.get_provider_config()
+        if provider_info["provider"] == "gemini":
+#           self.provider = gemini_provider( self, provider_info["key"], provider_info["model"] )
+            self.provider = gemini_provider( self )
+        elif provider_info["provider"] == "azure_gateway":
+            self.provider = azure_gateway_provider( self )
+        else:
+            return f"Unknown ai_engine: {provider_info['provider']}"
+        self.provider.open_session()
 
-        # User might ask for a different model in the prompt
-        model, prompt = self.extract_model_override(provider_info["model"], prompt )
+    def close_ai_session( self ):
+        self.provider.close_session()
+
+    def is_ai_request(self, prompt):
+        import string, shutil, os
+
+        # Tokenize and normalize
+        tokens = [t.strip(string.punctuation) for t in prompt.lower().split()]
+        if not tokens:
+            return False
+
+        first = tokens[0]
+
+        AMBIGUOUS_COMMANDS = {
+            "locate", "find", "which", "compare",
+            "sort", "split", "join", "write",
+        }
+
+        AI_TRIGGERS = {
+            "how", "why", "what", "when", "where", "who",
+            "explain", "describe", "tell", "show", "help",
+            "analyze", "interpret", "summarize", "compare",
+            "count", "find", "identify", "measure", "detect",
+            "decode", "please", "can", "could", "would",
+            "create", "generate",
+            "examine", "determine", "are", "ash",
+        }
+
+        NATURAL_LEADING_WORDS = {
+            "the", "a", "an", "this", "that", "these", "those",
+            "my", "your", "our", "their",
+        }
+
+        def looks_like_flag(tok: str) -> bool:
+            return tok.startswith("-")
+
+        def looks_like_path(tok: str) -> bool:
+            return tok.startswith(("/", "./", "../"))
+
+        def looks_like_glob(tok: str) -> bool:
+            return any(ch in tok for ch in "*?[")
+
+        def looks_like_filename(tok: str) -> bool:
+            # crude but effective: has a dot and no spaces
+            return "." in tok and not tok.startswith(".")
+
+        # ------------------------------------------------------------
+        # 1. If first word is an executable and NOT ambiguous → shell
+        # ------------------------------------------------------------
+        if shutil.which(first) is not None and first not in AMBIGUOUS_COMMANDS:
+            return False  # shell
+
+        # ------------------------------------------------------------
+        # 2. If any obvious AI trigger is present → AI
+        # ------------------------------------------------------------
+        if any(t in AI_TRIGGERS for t in tokens):
+            return True
+
+        # ------------------------------------------------------------
+        # 3. Special handling for ambiguous commands
+        # ------------------------------------------------------------
+        if first in AMBIGUOUS_COMMANDS:
+            second = tokens[1] if len(tokens) > 1 else ""
+
+            # Natural-language pattern: "find the ...", "compare the ...", etc.
+            if second in NATURAL_LEADING_WORDS:
+                return True  # AI
+
+            # Shell-like patterns: flags, paths, globs, filenames
+            if (
+                looks_like_flag(second)
+                or looks_like_path(second)
+                or looks_like_glob(second)
+                or looks_like_filename(second)
+            ):
+                return False  # shell
+
+            # If we get here, it's ambiguous; bias toward AI for safety
+            return True
+
+        # ------------------------------------------------------------
+        # 4. Fallback: no triggers, not ambiguous → assume shell
+        # ------------------------------------------------------------
+        return False
+
+    def make_ash_cloud_name(self, local_path: str) -> str:
+        ts_hex  = f"{int(time.time()) & 0xFFFFFFFF:08x}"
+        pid_hex = f"{os.getpid() & 0xFFFF:04x}"
+        base    = os.path.basename(local_path)
+        return f"{ts_hex}_{pid_hex}_{base}"
+
+    def is_ash_file(name: str) -> bool:
+        return bool(ASH_FILE_RE.match(name))
+
+#   def cleanup_cloud_files(client, max_age_seconds=24*3600):
+#       now = time.time()
+#       removed = 0
+#
+#       for f in client.files.list():
+#           name = f.name
+#
+#           # 1. Delete anything not created by Ash
+#           if not is_ash_file(name):
+#               try:
+#                   client.files.delete(name=name)
+#                   removed += 1
+#                   print(f"Deleted foreign cloud file: {name}")
+#               except Exception as e:
+#                   print(f"Warning: could not delete {name}: {e}")
+#               continue
+#
+#           # 2. Parse timestamp from filename
+#           ts_hex = name.split("_", 1)[0]
+#           try:
+#               ts = int(ts_hex, 16)
+#           except ValueError:
+#               # malformed → delete it
+#               try:
+#                   client.files.delete(name=name)
+#                   removed += 1
+#                   print(f"Deleted malformed cloud file: {name}")
+#               except Exception as e:
+#                   print(f"Warning: could not delete {name}: {e}")
+#               continue
+#
+#           # 3. Delete if older than max age
+#           if now - ts > max_age_seconds:
+#               try:
+#                   client.files.delete(name=name)
+#                   removed += 1
+#                   print(f"Deleted stale cloud file: {name}")
+#               except Exception as e:
+#                   print(f"Warning: could not delete {name}: {e}")
+#
+#       return removed
+
+
+    def ask_ai(self, prompt ):
+        cfg = self.cfg
+        user_prompt = cfg["ASH_USER_PROMPT"]
+        log_dir     = cfg["ASH_LOG_DIR"]
 
         output_file     = self.ai_output_file( prompt )
         input_file_list = self.ai_input_files( prompt, output_file )
@@ -155,21 +293,23 @@ class api_eda_ai_assist:
         response_text = "Fake Response"
         upload_bytes = len(full_prompt.encode("utf-8"))
         download_bytes = len(response_text.encode("utf-8"))
-        query_log  = os.path.join(logdir, "usage_queries.log")
-        totals_log = os.path.join(logdir, "usage_totals.log")
+        query_log  = os.path.join(log_dir, "usage_queries.log")
+        totals_log = os.path.join(log_dir, "usage_totals.log")
 
-        self.log_query_usage(query_log, ai_engine, api_key, upload_bytes, download_bytes)
-        self.log_user_totals(totals_log, ai_engine, api_key, upload_bytes, download_bytes)
+        identity = self.get_log_identity();
+        ai_engine = cfg["ASH_PROVIDER"]+":"+cfg["ASH_MODEL"]
+        api_key = cfg["ASH_API_KEY"]
+        self.log_query_usage(query_log,  ai_engine, api_key, upload_bytes, download_bytes, identity )
+        self.log_user_totals(totals_log, ai_engine, api_key, upload_bytes, download_bytes, identity )
 
-        username = os.getlogin()
-        if not self.user_in_usage_totals(username, totals_log ):
-            if not self.require_user_agreement(username, logdir):
-                return "User declined site restrictions."
+#       username = os.getlogin()
+#       if not self.user_in_usage_totals(username, totals_log ):
+#           if not self.require_user_agreement(username, log_dir):
+#               return "User declined site restrictions."
 
 
-#       ai_engine = ai_engine.lower();
-#       result = self.ask_ai_model( prompt, ai_engine, api_key )
-        result = self.ask_ai_model( prompt, provider_info, input_file_list )
+#       provider_info = self.get_provider_config()
+        result = self.ask_ai_model( prompt, input_file_list )
 
         if output_file:
             try:
@@ -183,61 +323,13 @@ class api_eda_ai_assist:
                 if result.startswith("AI error:"):
                     print(result)
         else:
-            print(result)
+#           print(result)
+            return result
 
-    def ask_ai_model( self, prompt, provider_info, input_file_list ):
-        if provider_info["provider"] == "gemini":
-            return self.ask_gemini(prompt, provider_info["key"], provider_info["model"], input_file_list )
-        else:
-            return f"Unknown ai_engine: {provider_info['provider']}"
-
-    def ask_gemini(self, prompt, api_key, model, input_file_list ):
-        from google import genai
-
-        # If api_key is None, the client auto‑reads GEMINI_API_KEY
-#       client = genai.Client() if api_key is None else genai.Client(api_key=api_key)
-        if api_key:
-            client = genai.Client(api_key=api_key)
-        else:
-            client = genai.Client()  # auto-reads GEMINI_API_KEY
-        
-        # 1. Upload each file using the Files API
-        uploaded_files = []
-        for each_file in input_file_list:
-#           uploaded_file = client.files.upload(file=each_file, mime_type='text/plain')
-            uploaded_file = client.files.upload(file=each_file)
-            uploaded_files.append(uploaded_file)
-            print(f"Uploaded file '{each_file}' as: {uploaded_file.name}")
-
-        # 2. Create the contents list for the prompt
-        # It's important to add descriptive text to help the model distinguish between files
-        contents = []
-        for i, file in enumerate(uploaded_files):
-            contents.append(f"Content of File {i+1} ({os.path.basename(input_file_list[i])}):")
-            contents.append(file)
-        contents.append(prompt)
-
-        try:
-            response = client.models.generate_content( model=model, contents=contents)
-#           response = client.models.generate_content( model="gemini-2.5-flash", contents=prompt)
-#           response = client.models.generate_content( model="gemini-2.5-flash-lite", contents=prompt)
-            return response.text.strip()
-        except Exception as e:
-            return f"AI error: {type(e).__name__}: {e}"
-
-#   def ask_ai_model( self, prompt, ai_engine, api_key ):
-#       if ai_engine == "gemini":
-#           return self.ask_gemini(prompt, api_key)
-#       else:
-#           return f"Unknown ai_engine: {ai_engine}"
-#       totals[username]["uploads"]   = str(int(totals[username]["uploads"].replace(",",""))   + upload_bytes)
-#       self.get_provider_config()
-#           return {
-#               "provider": "gemini",
-#               "key": key,
-#               "endpoint": "https://generativelanguage.googleapis.com/v1beta/openai",
-#               "model": os.getenv("ASH_MODEL", "gemini-2.0-flash"),
-#           }
+    def ask_ai_model( self, prompt, input_file_list ):
+        if self.debug:
+            print("ask_ai_model() %s" % prompt )
+        return self.provider.send_message( prompt, input_file_list );
 
     def extract_model_override(self, default_model, prompt):
         """
@@ -282,54 +374,52 @@ class api_eda_ai_assist:
 
         return override, cleaned
 
+#   def build_ai_prompt(self, user_prompt, input_file_list):
+#       parts = [user_prompt.strip(), "", "Attached files:"]
+#       for fname in input_file_list:
+#           try:
+#               with open(fname, "r", encoding="utf-8", errors="replace") as f:
+#                   contents = f.read()
+#           except OSError:
+#               continue  # or log/notify
+#           if self.is_binary_file(fname):
+#               print(f"Error: {fname} appears to be a binary file.")
+#               print("Ash can only process text-based input files.")
+#               print("Please provide a decoded or textual representation instead.")
+#               return
+#
+#           parts.append(f"--- BEGIN FILE {fname} ---")
+#           parts.append(contents)
+#           parts.append(f"--- END FILE {fname} ---")
+#       return "\n".join(parts).strip()
 
+#   def warn_if_large(self, full_prompt, threshold_mb=1.0):
+#       size_bytes = len(full_prompt.encode("utf-8"))
+#       size_mb = size_bytes / (1024 * 1024)
+#
+#       if size_mb > threshold_mb:
+#           print(f"Warning: prompt size is {size_mb:.2f} MB.")
+#           print("This may cost dollars rather than cents.")
+#           resp = input("Continue? [y/N]: ").strip().lower()
+#           return resp in ("y", "yes")
+#       return True
 
-    def build_ai_prompt(self, user_prompt, input_file_list):
-        parts = [user_prompt.strip(), "", "Attached files:"]
-        for fname in input_file_list:
-            try:
-                with open(fname, "r", encoding="utf-8", errors="replace") as f:
-                    contents = f.read()
-            except OSError:
-                continue  # or log/notify
-            if self.is_binary_file(fname):
-                print(f"Error: {fname} appears to be a binary file.")
-                print("Ash can only process text-based input files.")
-                print("Please provide a decoded or textual representation instead.")
-                return
-
-            parts.append(f"--- BEGIN FILE {fname} ---")
-            parts.append(contents)
-            parts.append(f"--- END FILE {fname} ---")
-        return "\n".join(parts).strip()
-
-    def warn_if_large(self, full_prompt, threshold_mb=1.0):
-        size_bytes = len(full_prompt.encode("utf-8"))
-        size_mb = size_bytes / (1024 * 1024)
-
-        if size_mb > threshold_mb:
-            print(f"Warning: prompt size is {size_mb:.2f} MB.")
-            print("This may cost dollars rather than cents.")
-            resp = input("Continue? [y/N]: ").strip().lower()
-            return resp in ("y", "yes")
-        return True
-
-    def is_binary_file(self, filename, blocksize=4096):
-        try:
-            with open(filename, "rb") as f:
-                chunk = f.read(blocksize)
-        except OSError:
-            return False  # treat unreadable as non-binary for now
-
-        # Heuristic: null bytes or too many non-text characters
-        if b"\x00" in chunk:
-            return True
-
-        # Count non-printable bytes
-        text_chars = bytearray({7,8,9,10,12,13,27} | set(range(0x20, 0x7F)))
-        nontext = sum(b not in text_chars for b in chunk)
-
-        return nontext / max(1, len(chunk)) > 0.30
+#   def is_binary_file(self, filename, blocksize=4096):
+#       try:
+#           with open(filename, "rb") as f:
+#               chunk = f.read(blocksize)
+#       except OSError:
+#           return False  # treat unreadable as non-binary for now
+#
+#       # Heuristic: null bytes or too many non-text characters
+#       if b"\x00" in chunk:
+#           return True
+#
+#       # Count non-printable bytes
+#       text_chars = bytearray({7,8,9,10,12,13,27} | set(range(0x20, 0x7F)))
+#       nontext = sum(b not in text_chars for b in chunk)
+#
+#       return nontext / max(1, len(chunk)) > 0.30
 
 
     def obfuscate_key(self, api_key):
@@ -339,21 +429,37 @@ class api_eda_ai_assist:
         h = hashlib.sha256(api_key.encode()).hexdigest()
         return h[:10]   # short, non‑reversible fingerprint
 
+    def get_log_identity(self):
+        """
+        Returns the identity string to store in logs based on ASH_LOG_IDENTITY.
+        Modes:
+            username  → real username
+            process   → anonymized process ID
+        """
+        mode = self.cfg.get("ASH_LOG_IDENTITY", "username").lower()
 
-    def log_query_usage(self, filename, model, api_key, upload_bytes, download_bytes):
+        if mode == "process":
+#           return str(os.getpid())
+            return "%08x" % os.getpid()
+
+        # Default: username
+        try:
+            return os.getlogin()
+        except Exception:
+            # Fallback if getlogin() fails (cron, systemd, etc.)
+            return os.environ.get("USER") or os.environ.get("USERNAME") or "unknown"
+
+    def log_query_usage(self, filename, model, api_key, upload_bytes, download_bytes, identity):
         import time
-        username = os.getlogin()
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         key_id = self.obfuscate_key(api_key)
-        line = f"{ts}\t{username}\t{model}\t{key_id}\t{upload_bytes}\t{download_bytes}\n"
+        line = f"{ts}\t{identity}\t{model}\t{key_id}\t{upload_bytes}\t{download_bytes}\n"
         with open( filename, "a") as f:
             f.write(line)
-        print("Oy", filename, line )
 
 
-    def log_user_totals(self, filename, model, api_key, upload_bytes, download_bytes):
+    def log_user_totals(self, filename, model, api_key, upload_bytes, download_bytes, identity):
         import os
-        username = os.getlogin()
         key_id = self.obfuscate_key(api_key)
         totals = {}
 
@@ -369,8 +475,8 @@ class api_eda_ai_assist:
                     totals[user] = data
 
         # Initialize user entry if missing
-        if username not in totals:
-            totals[username] = {
+        if identity not in totals:
+            totals[identity] = {
                 "uploads": "0",
                 "downloads": "0",
                 "model": model,
@@ -378,20 +484,20 @@ class api_eda_ai_assist:
             }
 
         # Update this user's totals
-        totals[username]["uploads"]   = str(int(totals[username]["uploads"].replace(",",""))   + upload_bytes)
-        totals[username]["downloads"] = str(int(totals[username]["downloads"].replace(",","")) + download_bytes)
-        totals[username]["model"] = model
-        totals[username]["key"] = key_id
+        totals[identity]["uploads"]   = str(int(totals[identity]["uploads"].replace(",",""))   + upload_bytes)
+        totals[identity]["downloads"] = str(int(totals[identity]["downloads"].replace(",","")) + download_bytes)
+        totals[identity]["model"] = model
+        totals[identity]["key"] = key_id
 
         # Compute total bytes across all users
         total_bytes_all = 0
         for user, data in totals.items():
-            total_bytes_all += int(data["uploads"]) + int(data["downloads"])
+            total_bytes_all += int(data["uploads"].replace(",","")) + int(data["downloads"].replace(",",""))
 
         # Compute percentage for each user
         # Store it temporarily in the dict for sorting and writing
         for user, data in totals.items():
-            user_bytes = int(data["uploads"]) + int(data["downloads"])
+            user_bytes = int(data["uploads"].replace(",","")) + int(data["downloads"].replace(",",""))
             pct = (user_bytes / total_bytes_all * 100) if total_bytes_all > 0 else 0.0
             data["pct"] = pct
 
@@ -412,8 +518,8 @@ class api_eda_ai_assist:
         with open(filename, "w") as f:
             for user, data in sorted_users:
                 pct_str = f"{data['pct']:.1f}%"
-                uploads = int(data['uploads'])
-                downloads = int(data['downloads'])
+                uploads = int(data['uploads'].replace(",",""))
+                downloads = int(data['downloads'].replace(",",""))
 
                 line = ( 
                     f"{user} " 
@@ -425,76 +531,85 @@ class api_eda_ai_assist:
                 )
                 f.write(line)
 
-    def user_in_usage_totals(self, username, log_path):
-        """
-        Returns True if the user already appears in usage_totals.log.
-        Otherwise returns False.
-        """
-        try:
-            with open(log_path, "r") as f:
-                for line in f:
-                    if line.strip().startswith(username + " "):
-                        return True
-        except FileNotFoundError:
-            # No log yet → no users recorded
-            return False
+#   def user_in_usage_totals(self, username, log_path):
+#       """
+#       Returns True if the user already appears in usage_totals.log.
+#       Otherwise returns False.
+#       """
+#       try:
+#           with open(log_path, "r") as f:
+#               for line in f:
+#                   if line.strip().startswith(username + " "):
+#                       return True
+#       except FileNotFoundError:
+#           # No log yet → no users recorded
+#           return False
+#
+#       return False
 
-        return False
-
-    def require_user_agreement(self, username, ash_dir):
-        """
-        If the user is new, display site_restrictions.txt (if present)
-        and ask for confirmation. Returns True if the user agrees,
-        False if they decline.
-        """
-
-        restrictions_path = os.path.join(ash_dir, "site_restrictions.txt")
-
-        # If no restrictions file exists, auto-approve
-        if not os.path.exists(restrictions_path):
-            return True
-
-        # Display restrictions
-        print("\n---------------- SITE RESTRICTIONS ----------------")
-        try:
-            with open(restrictions_path, "r") as f:
-                print(f.read().strip())
-        except Exception as e:
-            print(f"(Warning: could not read site_restrictions.txt: {e})")
-        print("---------------------------------------------------\n")
-
-        # Ask for confirmation
-        reply = input("Do you agree and wish to proceed? (yes/no): ").strip().lower()
-
-        if reply in ("yes", "y"):
-            return True
-
-        print("Request cancelled. You must agree to the site restrictions to continue.")
-        return False
+#   def require_user_agreement(self, username, ash_dir):
+#       """
+#       If the user is new, display site_restrictions.txt (if present)
+#       and ask for confirmation. Returns True if the user agrees,
+#       False if they decline.
+#       """
+#
+#       restrictions_path = os.path.join(ash_dir, "site_restrictions.txt")
+#
+#       # If no restrictions file exists, auto-approve
+#       if not os.path.exists(restrictions_path):
+#           return True
+#
+#       # Display restrictions
+#       print("\n---------------- SITE RESTRICTIONS ----------------")
+#       try:
+#           with open(restrictions_path, "r") as f:
+#               print(f.read().strip())
+#       except Exception as e:
+#           print(f"(Warning: could not read site_restrictions.txt: {e})")
+#       print("---------------------------------------------------\n")
+#
+#       # Ask for confirmation
+#       reply = input("Do you agree and wish to proceed? (yes/no): ").strip().lower()
+#
+#       if reply in ("yes", "y"):
+#           return True
+#
+#       print("Request cancelled. You must agree to the site restrictions to continue.")
+#       return False
 
 
     def ai_output_file(self, prompt):
         """
         Parse an output filename from a natural‑language request.
         Returns the filename as a string, or None if not found.
-        "output to file foo.txt"          → "foo.txt"
-        "write to bar.vcd"                → "bar.vcd"
-        "output to the file results.vcd"  → "results.vcd"
-        "write to a file named test.vcd"  → "named"  (and this is why we keep it simple)
+
+        Examples:
+            "output to file foo.txt"          → "foo.txt"
+            "write to bar.vcd?"               → "bar.vcd"
+            "output to the file results.vcd." → "results.vcd"
+            "write to a file named test.vcd"  → "named" (kept simple by design)
         """
         text = prompt.lower()
         TRIGGERS = ("output to", "write to")
         SKIP = {"file", "the", "a"}
+
+        def strip_trailing_punct(tok: str) -> str:
+            # Only remove punctuation that cannot be part of a filename
+            return tok.rstrip(".,;:!?")
+
         for trig in TRIGGERS:
             if trig in text:
                 after = text.split(trig, 1)[1].strip()
 
-                # Normalize punctuation
+                # Normalize punctuation spacing
                 tokens = after.replace(",", " ").replace(";", " ").split()
 
                 for token in tokens:
                     if token not in SKIP:
-                        return token
+                        clean = strip_trailing_punct(token)
+                        return clean
+
         return None
 
 
@@ -507,6 +622,10 @@ class api_eda_ai_assist:
         text = prompt.lower()
         TRIGGERS = ("file", "files", "analyze", "load")
         SKIP = {"the", "a", "an"}
+
+        # make sure "file foo.txt?" is "foo.txt"
+        def strip_punctuation(tok: str) -> str: 
+            return tok.rstrip(".,;:!?")
 
         cleaned = (
             text.replace(",", " ")
@@ -524,10 +643,13 @@ class api_eda_ai_assist:
                         break
                     if nxt in SKIP:
                         continue
-                    if os.path.exists(nxt):
+
+                    candidate = strip_punctuation(nxt)
+
+                    if os.path.exists(candidate):
                         # Exclude the output file if present
-                        if out_file is None or nxt != out_file:
-                            found.append(nxt)
+                        if out_file is None or candidate != out_file:
+                            found.append(candidate)
         return found
 
 
@@ -569,41 +691,111 @@ class api_eda_ai_assist:
             return None
 
 
-# Simple Version
-#   def get_env_config(self):
-#       api_key = os.environ.get("ASH_API_KEY")
-#       model   = os.environ.get("ASH_MODEL", "gemini")  # default
-#       user_prompt  = os.environ.get("ASH_USER_PROMPT", "").strip() 
-#       logdir  = os.environ.get("ASH_DIR", ".")     # default to cwd
-#       return api_key, model, user_prompt, logdir
-
-
     def get_provider_config(self):
-        provider = os.getenv("ASH_PROVIDER", "gemini")
+        if self.cfg is None:
+            self.get_env_config()
+        cfg = self.cfg
+        provider = cfg["ASH_PROVIDER"]
+        endpoint = cfg["ASH_ENDPOINT"]
+        model    = cfg["ASH_MODEL"]
+        key      = cfg["ASH_API_KEY"] 
+        return {
+            "provider": provider,
+            "key": key,
+            "endpoint": endpoint,
+            "model": model,
+        }
+ 
+    def get_env_config(self):
+        if self.cfg is not None:
+            return self.cfg
+        """
+        Load configuration in this priority order:
+            1. Internal Python defaults
+            2. User OS environment variable for ASH_DIR
+            3. Site defaults from $ASH_DIR/site_defaults.txt
+            4. User OS environment variables for any ASH_* key
+        """
 
-        if provider == "gemini":
-            # Prefer encrypted token, fall back to raw API key
-            token = os.getenv("ASH_GEMINI_TOKEN")
-            api_key = os.getenv("ASH_GEMINI_API_KEY")
+        # ------------------------------------------------------------
+        # 1. Internal defaults
+        # ------------------------------------------------------------
+        cfg = {
+            "ASH_DIR": os.path.expanduser("~/.ash"),
+            "ASH_PROVIDER": "gemini",
+            "ASH_ENDPOINT": "https://generativelanguage.googleapis.com/v1beta/openai",
+            "ASH_TOKEN": "",
+            "ASH_API_KEY": "",
+            "ASH_API_VERSION": "",
+            "ASH_MODEL": "gemini-2.0-flash",
+            "ASH_USER_PROMPT": "",
+            "ASH_LOG_IDENTITY": "username",
+            "ASH_LOG_DIR": None,   # will default to ASH_DIR later
+        }
 
-            key = None
-            if token:
-                secret_key = self.load_site_secret_key();
-                username, key = self.decrypt_token( secret_key, token )
-                if username != os.getlogin():
-                    key = None
-            if api_key:
-                key = api_key
-#           if not key:
-#               raise RuntimeError("No API key found for Gemini")          
-            # Gemini may default to GEMINI_API_KEY
+        # ------------------------------------------------------------
+        # 2. User OS environment variable for ASH_DIR (special case)
+        # ------------------------------------------------------------
+        if "ASH_DIR" in os.environ:
+            cfg["ASH_DIR"] = os.environ["ASH_DIR"]
 
-            return {
-                "provider": "gemini",
-                "key": key,
-                "endpoint": "https://generativelanguage.googleapis.com/v1beta/openai",
-                "model": os.getenv("ASH_MODEL", "gemini-2.0-flash"),
-            }
+        ash_dir = cfg["ASH_DIR"]
+
+        # ------------------------------------------------------------
+        # 3. Load site defaults from $ASH_DIR/site_defaults.txt
+        # ------------------------------------------------------------
+        site_defaults = {}
+        defaults_path = os.path.join(ash_dir, "site_defaults.txt")
+
+        if os.path.exists(defaults_path):
+            try:
+                with open(defaults_path, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if "=" in line:
+                            key, val = line.split("=", 1)
+                            key = key.strip()
+                            val = val.strip()
+                            if val.startswith('"') and val.endswith('"'):
+                                val = val[1:-1]
+                            site_defaults[key] = val
+            except Exception as e:
+                print(f"Warning: could not read site_defaults.txt: {e}")
+
+        # Apply site defaults (override internal defaults)
+        for key, val in site_defaults.items():
+            cfg[key] = val
+
+        # ------------------------------------------------------------
+        # 4. User OS environment variables override everything
+        # ------------------------------------------------------------
+        for key in cfg.keys():
+            if key in os.environ:
+                cfg[key] = os.environ[key]
+
+        # ------------------------------------------------------------
+        # 5. Use Token or API_KEY 
+        #    Note: Gemini may default to GEMINI_API_KEY
+        # ------------------------------------------------------------
+        ash_token = cfg["ASH_TOKEN"]
+        ash_key   = cfg["ASH_API_KEY"]
+        if ash_token:
+            secret_key = self.load_site_secret_key();
+            username, key = self.decrypt_token( secret_key, ash_token )
+            if username == os.getlogin():
+                cfg["ASH_API_KEY"] = key
+
+
+        # ------------------------------------------------------------
+        # Finalize dependent defaults
+        # ------------------------------------------------------------
+        if not cfg["ASH_LOG_DIR"]:
+            cfg["ASH_LOG_DIR"] = cfg["ASH_DIR"]
+
+        self.cfg = cfg
+
 
     def decrypt_token( self, secret_key, token ):
         import hmac, hashlib
@@ -630,85 +822,185 @@ class api_eda_ai_assist:
         return username, api_bytes.decode()
 
 
-    def get_env_config(self):
-        """
-        Load configuration in this priority order:
-            1. User environment variables
-            2. Site defaults from $ASH_DIR/site_defaults.txt
-            3. Hardcoded internal defaults
-        """
+# Abstract base provider class. This defines the contract.
+# Every provider must implement these two methods.
+class ai_provider:
+    def open_session(self):
+        raise NotImplementedError
 
-        # -----------------------------
-        # 1. Load site defaults
-        # -----------------------------
-        site_defaults = {}
-        ash_dir = os.environ.get("ASH_DIR")
+    def close_session(self):
+        raise NotImplementedError
 
-        if ash_dir:
-            defaults_path = os.path.join(ash_dir, "site_defaults.txt")
-            if os.path.exists(defaults_path):
-                try:
-                    with open(defaults_path, "r") as f:
-                        for line in f:
-                            line = line.strip()
+    def send_message(self, prompt, input_file_list):
+        raise NotImplementedError
 
-                            # Skip empty lines and comments
-                            if not line or line.startswith("#"):
-                                continue
+class azure_gateway_provider(ai_provider):
+    def __init__(self, parent):
+        self.parent = parent
+        self.client = None
+        self.chat = None
+        self.api_key = parent.cfg["ASH_API_KEY"]
+        self.model = parent.cfg["ASH_MODEL"]
+        self.session_file_list = []
+        self.debug = parent.debug
 
-                            # Accept KEY=value or KEY="value"
-                            if "=" in line:
-                                key, val = line.split("=", 1)
-                                key = key.strip()
-                                val = val.strip()
+    def open_session( self ):
+        if self.debug:
+            print("open_session(azure_gateway:%s)" % self.model )
+#       from openai import AzureOpenAI
+#       self.client = AzureOpenAI( azure_endpoint= self.parent.cfg["ASH_ENDPOINT"],
+#                                  api_key=        self.parent.cfg["ASH_API_KEY"],
+#                                  api_version=    self.parent.cfg["ASH_API_VERSION"] )
+#       self.chat = self.client.chat
+ 
+        self.intro   = [ {"role": "system", "content": "You are a concise, helpful assistant."} ]
+        self.history = []
+ 
+    def close_session( self ):
+        if self.debug:
+            print("close_session(azure_gateway)")
 
-                                # Strip optional surrounding quotes
-                                if val.startswith('"') and val.endswith('"'):
-                                    val = val[1:-1]
+    def send_message(self, prompt, input_file_list ):
+        message = []
+        file_blocks = []
+        file_message = None
 
-                                site_defaults[key] = val
-                except Exception as e:
-                    print(f"Warning: could not read site_defaults.txt: {e}")
+        # If a file is in the input_file_list and NOT in the session_file_list, upload it and add to session list
+        for each_file in input_file_list:
+            if not any( each_file == item[0] for item in self.session_file_list):
+                name = self.parent.make_ash_cloud_name( each_file ) # Timestamp+CPU_PID+each_name
+                self.session_file_list.append( (each_file, name ))
+        for each_file, name in self.session_file_list:
+            if self.debug:
+                print("uploading %s" % each_file )
+            with open( each_file, "r", encoding="utf-8") as f:
+                content = f.read()
+            file_blocks.append(f"=== FILE: {os.path.basename(each_file)} ===\n{content}\n")
+        files_context = "\n".join(file_blocks)
 
-        # -----------------------------
-        # 2. Resolve values with priority:
-        #    user env > site defaults > internal defaults
-        # -----------------------------
+        if self.session_file_list:
+          file_message = f"Here are my files:\n\n{files_context}\n\nAnswer questions using these files and referencing their filenames."
 
-        def resolve(key, internal_default):
-            # User env wins
-            if key in os.environ:
-                return os.environ[key]
+        if file_message:
+            message.append({"role": "user", "content": file_message })
+        message += [ self.intro ]
+        message += self.history
+        prompt_message = {"role": "user", "content": prompt}
+#       response = self.chat.completions.create( model=self.model, messages= message )
+#       answer = response.choices[0].message.content
+        if self.debug:
+            print( message )
+        answer = "A:" + str( prompt )
+        self.history.append( prompt_message )
+        self.history.append({"role": "assistant", "content": answer})
+        return answer
 
-            # Otherwise site default
-            if key in site_defaults:
-                return site_defaults[key]
 
-            # Otherwise internal default
-            return internal_default
+class gemini_provider(ai_provider):
+    def __init__(self, parent):
+        self.parent = parent
+        self.client = None
+        self.chat = None
+        self.api_key = parent.cfg["ASH_API_KEY"]
+        self.model = parent.cfg["ASH_MODEL"]
+        self.session_file_list = []
+        self.debug = parent.debug
 
-        # Internal defaults (lowest priority)
-#       default_model = "gemini-2.5-flash-lite"
-        default_user_prompt = ""
-        default_logdir = ash_dir if ash_dir else "."
+    def open_session( self ):
+        if self.debug:
+            print("open_session(gemini:%s)" % self.model )
+        from google import genai
+ 
+        # If api_key is None, the client auto‑reads GEMINI_API_KEY
+        if self.api_key:
+            self.client = genai.Client(api_key=self.api_key)
+        else:
+            self.client = genai.Client()  # auto-reads GEMINI_API_KEY
+        self.chat = self.client.chats.create(model=self.model)
 
-        # Resolve final values
-#       api_key     = resolve("ASH_API_KEY", None)
-#       provider    = resolve("ASH_PROVIDER", default_model)
-#       model       = resolve("ASH_MODEL", default_model)
-        user_prompt = resolve("ASH_USER_PROMPT", default_user_prompt)
-        logdir      = resolve("ASH_LOG_DIR", default_logdir)
+    def close_session( self ):
+        if self.debug:
+            print("close_session(gemini)")
+            print("Current Files:")
+        for file in self.client.files.list():
+            # Name: files/2qgse62no0hh | Display Name: None | URI: https://generativelanguage.googleapis.com/v1beta/files/2qgse62no0hh
+            print(f"- Name: {file.name} | Display Name: {file.display_name} | URI: {file.uri}")
+            try:
+                self.client.files.delete(name = file.name )
+                if self.debug:
+                    print("File deleted successfully.")
+            except:
+                if self.debug:
+                    print("Failed to delete.")
 
-#       return api_key, model, user_prompt, logdir
-        return user_prompt, logdir
+    def send_message(self, prompt, input_file_list ):
+        if self.debug:
+            print("send_message(gemini) %s" % prompt )
+        client = self.client
+        chat = self.chat
+        session_file_list = self.session_file_list
+
+        # If a file is in the input_file_list and NOT in the session_file_list, upload it and add to session list
+        for each_file in input_file_list:
+            if not any( each_file == item[0] for item in session_file_list):
+                if self.debug:
+                    print(f"Attempting to Upload file '{each_file}'")
+                # 1. Upload each file using the Files API
+                name = self.parent.make_ash_cloud_name( each_file ) # Timestamp+CPU_PID+each_name
+                uploaded_file = client.files.upload(file=each_file, config={'mime_type':'text/plain', 'display_name':name})
+                if self.debug:
+                    print(f"Uploaded file '{each_file}' as: {uploaded_file.name}") # Uploaded file 'foo.txt' as: files/bd0blct1aolk
+                session_file_list.append( (each_file, uploaded_file ))
+
+#       # 2. Create the contents list for the prompt using only files in the input_file_list
+#       # It's important to add descriptive text to help the model distinguish between files
+        contents = []; i = 0;
+        if input_file_list:
+            contents.append("Here are files for analysis")
+            for each_file, uploaded_file in session_file_list:
+                if each_file in input_file_list:
+                    contents.append(f"File {i+1} ({os.path.basename( each_file )}):")
+                    contents.append(uploaded_file)
+        contents.append(prompt)
+
+#       print("Current Files:")
+#       for file in client.files.list():
+#           # Name: files/2qgse62no0hh | Display Name: None | URI: https://generativelanguage.googleapis.com/v1beta/files/2qgse62no0hh
+#           print(f"- Name: {file.name} | Display Name: {file.display_name} | URI: {file.uri}")
+
+        # print( contents )
+        #['Content of File 1 (foo.txt):', File(
+        #  create_time=datetime.datetime(2026, 2, 12, 18, 40, 47, 491241, tzinfo=TzInfo(0)),
+        #  display_name='foo.txt',
+        #  expiration_time=datetime.datetime(2026, 2, 14, 18, 40, 47, 20205, tzinfo=TzInfo(0)),
+        #  mime_type='text/plain',
+        #  name='files/t9oczyrv66u3',
+        #  sha256_hash='YTg4M2RhZmM0ODBkNDY2ZWUwNGUwZDZkYTk4NmJkNzhlYjFmZGQyMTc4ZDA0NjkzNzIzZGEzYThmOTVkNDJmNA==',
+        #  size_bytes=5,
+        #  source=<FileSource.UPLOADED: 'UPLOADED'>,
+        #  state=<FileState.ACTIVE: 'ACTIVE'>,
+        #  update_time=datetime.datetime(2026, 2, 12, 18, 40, 47, 491241, tzinfo=TzInfo(0)),
+        #  uri='https://generativelanguage.googleapis.com/v1beta/files/t9oczyrv66u3'
+        #), 'Content of File 2 (bar.txt):', File(
+        #    ...
+        #
+        #)]
+
+        try:
+            response = chat.send_message( contents )
+            if self.debug:
+                print("chat.send_message(gemini) \nQ: %s \nA: %s" % ( contents, response.text.strip() ) )
+            return response.text.strip()
+        except Exception as e:
+            return f"AI error: {type(e).__name__}: {e}"
+
 
 # ---------- Version ----------
-def print_version():
-    import os
+def print_version( self ):
     import textwrap
 
-    ash_dir = os.environ.get("ASH_DIR", "<not set>")
-    model = os.environ.get("ASH_MODEL", "gemini-2.0-flash")
+    self.get_env_config()
+    cfg = self.cfg
 
     version_text = f"""
     Ash — AI‑Enabled EDA Assistant
@@ -718,8 +1010,13 @@ def print_version():
     It operates using a site‑assigned API key and a configurable AI model.
 
     Current Configuration
-      ASH_DIR:   {ash_dir}
-      ASH_MODEL: {model}
+      ASH_DIR:          {cfg.get("ASH_DIR")}
+      ASH_PROVIDER:     {cfg.get("ASH_PROVIDER")}
+      ASH_MODEL:        {cfg.get("ASH_MODEL")}
+      ASH_ENDPOINT:     {cfg.get("ASH_ENDPOINT")}
+      ASH_API_VERSION:  {cfg.get("ASH_API_VERSION")}
+      ASH_LOG_DIR:      {cfg.get("ASH_LOG_DIR")}
+      ASH_LOG_IDENTITY: {cfg.get("ASH_LOG_IDENTITY")}
 
     License
       This program is free software: you can redistribute it and/or modify
@@ -730,99 +1027,74 @@ def print_version():
       Kevin Hubbard — Black Mesa Labs
       Additional engineering assistance provided by Microsoft Copilot.
     """
+
     print(textwrap.dedent(version_text).rstrip())
 
 
 # ---------- Help Manual ----------
-def print_help( ):
-    import os
+def print_help(self):
     import textwrap
 
-    ash_dir = os.environ.get("ASH_DIR", "<not set>")
-    model = os.environ.get("ASH_MODEL", "gemini-2.0-flash")  # or whatever default you use
+    self.get_env_config()
+    cfg = self.cfg
+
+    help_text = f"""
+    Usage: ash [options] [command]
+
+    Ash is a command‑line assistant for natural‑language analysis of EDA files.
+    It can execute shell commands or interpret plain‑English requests using the
+    configured AI provider.
+
+    Options:
+      -h, --help        Show this help message and exit
+      -v, --version     Show version and configuration information
+
+    Shell Behavior:
+      • Commands that match executables run in the system shell
+      • Natural‑language requests are routed to the AI engine
+      • Use Ctrl+D on an empty line to enter or exit multi‑line mode
+      • History, bang expansion, and tab completion are supported
+
+    AI Configuration:
+      Provider:    {cfg.get("ASH_PROVIDER")}
+      Model:       {cfg.get("ASH_MODEL")}
+      Endpoint:    {cfg.get("ASH_ENDPOINT")}
+      API Version: {cfg.get("ASH_API_VERSION")}
+      API Key:     {'<set>' if cfg.get('ASH_API_KEY') else '<not set>'}
+
+    File Locations:
+      ASH_DIR:    {cfg.get("ASH_DIR")}
+      Log Dir:    {cfg.get("ASH_LOG_DIR")}
+      Identity:   {cfg.get("ASH_LOG_IDENTITY")}  (username or process)
+
+    Environment Variables:
+      ASH_DIR            Base directory for site configuration
+      ASH_PROVIDER       AI provider name (default: gemini)
+      ASH_MODEL          Model name for the provider
+      ASH_ENDPOINT       Provider API endpoint
+      ASH_API_VERSION    Provider API version
+      ASH_API_KEY        Raw API key (optional if ASH_TOKEN is used)
+      ASH_TOKEN          Encrypted API token (site‑managed)
+      ASH_USER_PROMPT    Optional prefix added to all AI requests
+      ASH_LOG_DIR        Directory for usage logs
+      ASH_LOG_IDENTITY   'username' or 'process'
+
+    Examples:
+      ash
+      ash "summarize file foo.vcd"
+      ash "how many lines are in bar.txt?"
+      ash "compare files foo.vcd bar.vcd"
+    """
+
+    print(textwrap.dedent(help_text).rstrip())
 
     # Optional site files
+    ash_dir = cfg.get("ASH_DIR")
     billing_path = os.path.join(ash_dir, "site_billing.txt") if ash_dir != "<not set>" else None
     restrictions_path = os.path.join(ash_dir, "site_restrictions.txt") if ash_dir != "<not set>" else None
 
     billing_text = ""
     restrictions_text = ""
-
-    if billing_path and os.path.exists(billing_path):
-        with open(billing_path, "r") as f:
-            billing_text = f.read().strip()
-
-    if restrictions_path and os.path.exists(restrictions_path):
-        with open(restrictions_path, "r") as f:
-            restrictions_text = f.read().strip()
-
-    help_text = f"""
-    Ash — AI‑Enabled EDA Assistant
-    Version: {ASH_VERSION}
-    Usage: ash [OPTIONS] [COMMAND]
-
-    Ash is a command‑line tool for analyzing Electronic Design Automation (EDA) files
-    using natural‑language instructions. It accepts plain English requests such as
-    "analyze foo.v" or "summarize timing issues in bar.sdc" and produces structured,
-    deterministic output suitable for engineering workflows.
-
-    Ash operates entirely at user level. It does not require elevated privileges and
-    does not modify system configuration. All AI requests are performed using the
-    API key assigned to this site installation.
-
-    Environment Variables
-      ASH_DIR
-          Directory containing site configuration files such as:
-            site_key.txt          Site secret key (required)
-            site_billing.txt      Optional billing information
-            site_restrictions.txt Optional usage restrictions
-            site_model.txt        Optional default model override
-
-      ASH_PROVIDER
-          AI Provider. Defaults to gemini.
-
-      ASH_GEMINI_TOKEN
-          Base64‑encoded, per‑user encrypted API key blob. Issued by the site
-          administrator. Required for all AI operations to Google Gemini.
-
-      ASH_MODEL
-          Overrides the default AI model for this session.
-          Current model: {model}
-
-    Changing the Model from the Prompt
-      You may request a different model inline:
-          "use model gemini‑2.0‑flash and analyze foo.v"
-      or by setting the environment variable:
-          export ASH_MODEL=gemini‑2.0‑flash
-    
-    Specifying Input and Output Files in English
-     Ash accepts natural‑language file directives:
-          "file foo.v"
-          "file constraints.sdc"
-          "output to file results.txt"
-
-      Multiple input files may be provided:
-          "file top.v, file alu.v, analyze timing"
-
-      Output files are written exactly as specified.
-
-    One‑Shot Mode
-      When invoked with arguments, Ash runs a single request and exits:
-          ash analyze foo.v
-          ash summarize timing issues in top.sdc
-
-    License
-      Ash (eda_ai_assist) is free software released under the
-      GNU General Public License (GPL), version 3 or later.
-
-    Authors
-      Kevin Hubbard — Black Mesa Labs
-      Additional engineering assistance provided by Microsoft Copilot.
-
-    Site‑Specific Information
-    """
-
-    print(textwrap.dedent(help_text).rstrip())
 
     # Append optional sections
     if billing_text:
@@ -835,7 +1107,6 @@ def print_help( ):
         print("-----------------------------------------")
         print(restrictions_text)
     print()
-
 
 
 # ---------- Platform Detection ----------
@@ -880,12 +1151,17 @@ def detect_shell() -> Tuple[ShellType, str]:
         return "csh", csh_path
 
 # ---------- Prompt ----------
-def format_prompt() -> str:
+def format_prompt(buffering_ai, buffering_ai_ctrl_d_hint_sent ) -> str:
+    if buffering_ai:
+      prompt = "...> "
+      if not buffering_ai_ctrl_d_hint_sent:
+        prompt = "(Ctrl+D to send)\n"+prompt
+      return prompt
     cwd = truncate_string(os.getcwd())
 #   return f"{PROMPT_COLOR}{cwd}{RESET_COLOR} % "
     return f"[ash]:{cwd}% "
 
-def truncate_string(input_string, max_length=20):
+def truncate_string(input_string, max_length=30):
     # Truncates a string to the last 'max_length' characters if it's longer.
     if len(input_string) > max_length:
         return input_string[-max_length:]
@@ -1160,10 +1436,16 @@ def print_history():
     for i, cmd in enumerate(hist, start=1):
         print(f"{i:5d}  {cmd}")
 
-# ---------- Main REPL ----------
+# --- Main REPL (Read-Eval-Print Loop) ---
 def main():
     ai = api_eda_ai_assist()
     shell_type, shell_path = detect_shell()
+    provider = None
+    buffering_ai_ctrl_d_hint_sent = False
+    buffering_ai = False
+    paste_buffer = []  
+    BLOCK_INTRO_RE = None
+    full_prompt = None
 
     _init_readline()
     if on_windows() and not _readline_available:
@@ -1176,11 +1458,11 @@ def main():
         pass
 
     if "--help" in sys.argv or "-h" in sys.argv:
-        print_help()
+        print_help( ai )
         return
 
     if "--version" in sys.argv or "-v" in sys.argv:
-        print_version()
+        print_version( ai )
         return
 
 
@@ -1188,19 +1470,22 @@ def main():
     if len(sys.argv) > 1: # Example: python ash.py analyze foo.txt 
         line = " ".join(sys.argv[1:]) 
         api_key = None
-        rts = ai.ask_ai( line, ai_engine="not_gemini", api_key=api_key )
+        ai.open_ai_session();
+        rts = ai.ask_ai( line )
         print( rts )
+        if ai.provider:
+            ai.close_ai_session();
         return
 
-#   banner = f"{shell_type} wrapper (using {shell_path}). Type `history`, `exit`, or press Ctrl+D to quit."
+#   banner = f"{shell_type} wrapper (using {shell_path}). Type `history`, `exit`, or press Ctrl+C to quit."
 #   print(banner)
 #                                                                                         #  
     print("------------------------------------------------------------------------")
-    print("Hi, I'm Ash (eda_ai_assist), your AI EDA assistant from Black Mesa Labs.")
-    print("I interpret plain‑English instructions and analyze EDA files.")
-    print("Type exit or press Ctrl+D to terminate.")
+    print("Hi, I'm Ash (eda_ai_assist), your cloud‑based AI EDA assistant.         ")
+    print("From your shell, I interpret plain‑English and analyze your EDA files.  ")
+    print("I became operational at Black Mesa Labs on February 8th, 2026.          ")
+    print("Press Ctrl+D on an empty line to enter or exit multi‑line input mode.   ")
     print("------------------------------------------------------------------------")
-
 
 
     while True:
@@ -1209,15 +1494,45 @@ def main():
                 signal.signal(signal.SIGINT, signal.SIG_DFL)
             except Exception:
                 pass
+            try:
+                line = input(format_prompt(buffering_ai,buffering_ai_ctrl_d_hint_sent ))
+                if buffering_ai:
+                  buffering_ai_ctrl_d_hint_sent = True
+                else:
+                  buffering_ai_ctrl_d_hint_sent = False
+            except EOFError:
+               # Ctrl-D pressed on an empty line
+                if not buffering_ai:
+                    # Enter buffering mode
+                    buffering_ai = True
+                    paste_buffer = []
+                    print("(Begin Buffering. Type your prompt and paste your data. Ctrl+D again to finish.)")
+                    continue
+                else:
+                    # Exit buffering mode and send
+                    buffering_ai = False
+                    full_prompt = "\n".join(paste_buffer)
+                    paste_buffer = []
+                    if not ai.provider:
+                        print("ai.open_ai_session()")
+                        ai.open_ai_session()
+                    rts = ai.ask_ai(full_prompt)
+                    print(rts)
+                    continue
 
-            line = input(format_prompt())
             if not line.strip():
                 continue
+
         except EOFError:
             print()
             break
         except KeyboardInterrupt:
             print()
+            continue
+
+        # If we are already buffering an AI request, ALL lines go to the buffer 
+        if buffering_ai: 
+            paste_buffer.append(line) 
             continue
 
         # Mirror raw input into in-memory history so bang expansion sees it
@@ -1240,11 +1555,11 @@ def main():
         stripped = line.strip()
 
         # Exit conditions
-        if stripped in {"exit", "quit"}:
+        if stripped in {"exit", "quit"} :
             break
 
         # Built-in 'history' (show wrapper's numbering)
-        if stripped == "history":
+        if stripped == "history" and not buffering_ai:
             print_history()
             continue
 
@@ -1260,22 +1575,28 @@ def main():
             continue
 
         # Built-in cd
-        if stripped.startswith("cd"):
+        if stripped.startswith("cd") :
             parts = stripped.split(maxsplit=1)
             arg = parts[1] if len(parts) == 2 else ""
             handle_cd(arg)
             continue
 
-        if ai.is_ai_request( line ):
-#           print( "This was an AI request" )
-            api_key = None
-            rts = ai.ask_ai( line, ai_engine="not_gemini", api_key=api_key )
-            print( rts )
+        # Normal single-line AI request
+        if ai.is_ai_request(line):
+            if not ai.provider:
+                print("ai.open_ai_session()")
+                ai.open_ai_session()
+            rts = ai.ask_ai(line)
+            print(rts)
             continue
-
-
+         
         # Delegate to the detected shell
+        print("OS_CALL: %s" % line )
         _ = run_shell_command(shell_type, shell_path, line)
+        
+
+    if ai.provider:
+        ai.close_ai_session();
 
     _save_history()
     print("Bye.")
