@@ -19,7 +19,6 @@
 # The technical name is eda_ai_assist but the ChatBot is known as Ash.
 
 # TODO: Hookup find_old_ash_files() to a cloud file cleanup routine.
-#
 ########################################################################
 
 """
@@ -1686,9 +1685,13 @@ def run_shell_command(shell_type: str, shell_path: str, command: str) -> int:
     try:
         completed = _subprocess.run(
             argv,
-            stdin=_subprocess.DEVNULL, # Ensure child process doesn't inherit stdin for non-interactive commands
-            stdout=sys.stdout,
-            stderr=sys.stderr,
+            stdin=None,
+            stdout=None,
+            stderr=None,
+# This breaks Vi being called from Ash
+#           stdin=_subprocess.DEVNULL, # Ensure child process doesn't inherit stdin for non-interactive commands
+#           stdout=sys.stdout,
+#           stderr=sys.stderr,
             cwd=os.getcwd(),
             env=os.environ.copy(),
             text=False, # Use bytes for stdin/stdout to avoid encoding issues with raw shell output
