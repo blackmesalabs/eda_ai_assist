@@ -81,8 +81,8 @@ _win_completion_active = False
 # Metadata
 __title__ = "ash(eda_ai_assist)"
 __description__ = "Ash: a REPL and API for external EDA programs."
-__version__ = "1.0.2"
-__version_info__ = (1, 0, 2)
+__version__ = "1.0.3"
+__version_info__ = (1, 0, 3)
 __author__ = "Kevin M. Hubbard, Black Mesa Labs"
 __license__ = "GPL3"
 
@@ -92,6 +92,7 @@ class api_eda_ai_assist:
         self.provider = None
         self.cfg = None
         self.debug = False
+        self._warnings = []
         # Session-scoped list of logical files Ash is tracking (local paths)
         self.session_file_list: List[str] = []
         # Centralized token counters
@@ -100,6 +101,10 @@ class api_eda_ai_assist:
         self.token_cnt_total = 0
         # Last AI response time for status
         self.last_response_time = 0.0
+
+    def get_warnings(self):
+        return list(self._warnings)
+
 
     # ---------- Version ----------
     def print_version(self):
@@ -337,6 +342,8 @@ class api_eda_ai_assist:
             self.provider = gemini_provider(self)
         elif provider_info["provider"] == "azure_gateway":
             self.provider = azure_gateway_provider(self)
+        elif provider_info["provider"] == "aws_bedrock":
+            self.provider = aws_bedrock_provider(self)
         else:
             print(f"Error: Unknown AI provider: {provider_info['provider']}", file=sys.stderr)
             return
@@ -602,7 +609,7 @@ class api_eda_ai_assist:
 
     # ---------- AI front-end ----------
     def ask_ai(self, prompt):
-        warnings = []
+        self._warnings = []
         cfg = self.cfg
         user_prompt = cfg["ASH_USER_PROMPT"]
         log_dir = cfg["ASH_LOG_DIR"]
@@ -612,7 +619,7 @@ class api_eda_ai_assist:
             if os.path.exists(output_file):
                 reply = f"Error: output file '{output_file}' already exists."
                 reply += "\nI’m not allowed to delete user files. You’ll need to do that yourself."
-                return reply, warnings
+                return reply
 
         input_file_list, delete_file_list = self.ai_input_files(prompt, output_file)
 
@@ -626,6 +633,8 @@ class api_eda_ai_assist:
                     print(str(each))
 
         intro_prompt = self.load_site_prompt()
+        under_the_hood = f"You are powered under the hood by model {cfg['ASH_MODEL']} from {cfg['ASH_PROVIDER']}."
+        intro_prompt += "\n" + under_the_hood
 
         ignore_prompt = ""
         if delete_file_list:
@@ -633,11 +642,17 @@ class api_eda_ai_assist:
                 ignore_prompt += "Ignore the request to delete file %s .\n" % each_file
 
         custom_prompt = ignore_prompt + prompt
-        full_prompt = custom_prompt # This variable is not used after this point.
+
+        # Normalize prompt to use basenames instead of full paths
+        normalized_prompt = custom_prompt
+        for file_path in input_file_list:
+            basename = os.path.basename(file_path)
+            normalized_prompt = normalized_prompt.replace(file_path, basename)
+
 
         result = "Fake Response"
         if self.provider:
-            result, warnings = self.ask_ai_model(custom_prompt, intro_prompt, input_file_list, delete_file_list)
+            result = self.ask_ai_model(normalized_prompt, intro_prompt, input_file_list, delete_file_list)
         else:
             result = "AI provider not initialized. Use 'restart' to open a session."
 
@@ -651,12 +666,12 @@ class api_eda_ai_assist:
                     size_str = f"{size_mb:,.1f} MB"
                 except Exception:
                     size_str = "unknown size"
-                return f"Created {output_file} ({size_str})", warnings
+                return f"Created {output_file} ({size_str})"
             except Exception as e:
                 print(f"Error writing to {output_file}: {e}", file=sys.stderr)
                 print(result) # Still print AI response to console if file write fails
         else:
-            return result, warnings
+            return result
 
     def ask_ai_model(self, prompt, intro_prompt, input_file_list, delete_file_list):
         if self.debug:
@@ -676,17 +691,17 @@ class api_eda_ai_assist:
         self.token_cnt_total += total_tokens
 
         # Enforce new token limit strategy
-        warnings = []
+        self._warnings = []
         if self.token_cnt_total >= ASH_TOKEN_LIMIT:
             # Hard limit: immediate termination
-            warnings.append(
+            self._warnings.append(
                 f"CRITICAL: Total token usage ({self.token_cnt_total:,}) has exceeded "
                 f"the absolute limit ({ASH_TOKEN_LIMIT:,})."
             )
-            warnings.append(
+            self._warnings.append(
                 "The AI session will be automatically closed to prevent runaway costs/instability."
             )
-            warnings.append(
+            self._warnings.append(
                 "Please consider using 'flush' or 'restart' to start a new session."
             )
 
@@ -694,26 +709,26 @@ class api_eda_ai_assist:
             self.close_ai_session()
 
             # Return a termination message AND the warnings
-            return "AI session terminated due to excessive token usage. Please use 'restart' for a new session.", warnings
+            return "AI session terminated due to excessive token usage. Please use 'restart' for a new session."
 
         elif self.token_cnt_total >= ASH_TOKEN_STRONG_WARN:
-            warnings.append(
+            self._warnings.append(
                 f"STRONG WARNING: Total token usage ({self.token_cnt_total:,}) is approaching "
                 f"the limit ({ASH_TOKEN_LIMIT:,})."
             )
-            warnings.append(
+            self._warnings.append(
                 "Consider using 'flush' or 'restart' to clear the session history and start fresh."
             )
 
         elif self.token_cnt_total >= ASH_TOKEN_WARN:
-            warnings.append(
+            self._warnings.append(
                 f"WARNING: Total token usage ({self.token_cnt_total:,}) is moderately high."
             )
-            warnings.append(
+            self._warnings.append(
                 "Long conversation histories may degrade performance or incur higher costs. Use 'flush' to clear."
             )
 
-        return result_text, warnings
+        return result_text
 
 
     def extract_model_override(self, default_model, prompt):
@@ -984,6 +999,7 @@ Be concise, avoid emojis, and do not use Markdown unless explicitly asked.
             if key in os.environ:
                 cfg[key] = os.environ[key]
 
+        # ASH_TOKEN is deprecated version of ASH_USER_TOKEN
         if cfg["ASH_TOKEN"] and not cfg["ASH_USER_TOKEN"]:
             ash_token = cfg["ASH_TOKEN"]
         else:
@@ -1287,6 +1303,193 @@ class ai_provider:
         raise NotImplementedError
 
 
+# ---------- AWS Bedrock provider ----------
+class aws_bedrock_provider(ai_provider):
+    def __init__(self, parent: api_eda_ai_assist):
+        self.parent = parent
+        self.client = None
+        self.aws_access_key_id = parent.cfg.get("ASH_AWS_ACCESS_KEY_ID", None)
+        self.aws_secret_access_key = parent.cfg.get("ASH_AWS_SECRET_ACCESS_KEY", None)
+        self.aws_region = parent.cfg.get("ASH_AWS_REGION", "us-east-1")
+        self.model = parent.cfg["ASH_MODEL"]
+        # (local_path, cloud_name) - no remote storage, cloud_name is for tracking only
+        self._session_files: List[tuple[str, str]] = []
+        self.history: List[Dict[str, Any]] = []  # Tracks conversation turns only
+        self.debug = parent.debug
+
+    def open_session(self):
+        if self.debug:
+            print("open_session(aws_bedrock:%s)" % self.model)
+        import boto3
+
+        if self.aws_access_key_id and self.aws_secret_access_key:
+            self.client = boto3.client(
+                service_name="bedrock-runtime",
+                region_name=self.aws_region,
+                aws_access_key_id=self.aws_access_key_id,
+                aws_secret_access_key=self.aws_secret_access_key,
+            )
+        else:
+            # Fall back to boto3 default credential chain (IAM role, ~/.aws/credentials, etc.)
+            self.client = boto3.client(
+                service_name="bedrock-runtime",
+                region_name=self.aws_region,
+            )
+        self.history = []  # Reset history on new session
+
+    def close_session(self):
+        if self.debug:
+            print("close_session(aws_bedrock)")
+            print("Clearing in-memory session files:")
+            for local_path, _ in self._session_files:
+                print(f"- {local_path}")
+        self._session_files.clear()
+        self.history = []
+        self.client = None
+
+    def delete_file(self, local_path: str):
+        before = list(self._session_files)
+        self._session_files = [
+            item for item in self._session_files if item[0] != local_path
+        ]
+        if self.debug:
+            removed = [p for p, _ in before if p not in [q for q, _ in self._session_files]]
+            if removed:
+                print(f"aws_bedrock_provider: removed from _session_files: {removed}")
+        self.parent.session_file_list = [
+            p for p in self.parent.session_file_list if p != local_path
+        ]
+
+    def send_message(
+        self, prompt, intro_prompt, input_file_list, delete_file_list
+    ) -> Tuple[str, int, int, int]:
+        if self.debug:
+            print("send_message(aws_bedrock) %s" % prompt)
+
+        if delete_file_list:
+            before_provider_files = list(self._session_files)
+            self._session_files = [
+                item for item in self._session_files if item[0] not in delete_file_list
+            ]
+            if self.debug:
+                removed = [p for p, _ in before_provider_files if p not in [q for q, _ in self._session_files]]
+                if removed:
+                    print(f"aws_bedrock_provider: removed from _session_files (due to prompt): {removed}")
+            self.parent.session_file_list = [
+                p for p in self.parent.session_file_list if p not in delete_file_list
+            ]
+
+        # Register any new files into the session tracking list
+        for each_file in input_file_list:
+            if each_file not in self.parent.session_file_list:
+                self.parent.session_file_list.append(each_file)
+            if not any(each_file == item[0] for item in self._session_files):
+                name = self.parent.make_ash_cloud_name(each_file)
+                self._session_files.append((each_file, name))
+
+        # Re-read all session files fresh on every call (mirrors azure_gateway_provider behavior)
+        file_blocks = []
+        for each_file, name in self._session_files:
+            if os.path.exists(each_file):
+                try:
+                    size_bytes = os.path.getsize(each_file)
+                    size_mb = size_bytes / (1024 * 1024)
+                    size_str = f"{size_mb:,.1f} MB"
+                except Exception:
+                    size_str = "unknown size"
+                if self.debug:
+                    print(f"reading {each_file} ({size_str})")
+                try:
+                    with open(each_file, "r", encoding="utf-8") as fh:
+                        content = fh.read()
+                    file_blocks.append(
+                        f"=== FILE: {os.path.basename(each_file)} ===\n{content}\n"
+                    )
+                except Exception as e:
+                    print(f"Error reading file '{each_file}': {e}", file=sys.stderr)
+
+        # Assemble messages in the same order as azure_gateway_provider:
+        # [file content block] → [history] → [current user prompt]
+        # The intro_prompt is passed separately as the Bedrock "system" parameter.
+        messages = []
+
+        if file_blocks:
+            files_context = "\n".join(file_blocks)
+            file_message_text = (
+                f"Here are my files:\n\n{files_context}\n\n"
+                f"Answer questions using these files and referencing their filenames."
+            )
+            messages.append({"role": "user", "content": [{"type": "text", "text": file_message_text}]})
+            # Bedrock requires alternating roles; add a minimal assistant acknowledgement
+            # so history can follow cleanly after the file block
+            messages.append({"role": "assistant", "content": [{"type": "text", "text": "Understood. I have reviewed the files and am ready to answer questions."}]})
+
+        prompt_message = {"role": "user", "content": [{"type": "text", "text": prompt}]}
+        messages += self.history
+        messages.append(prompt_message)
+
+        try:
+            import json
+
+            request_body = {
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 8192,
+                # intro_prompt goes here as a top-level "system" field —
+                # the idiomatic Bedrock/Anthropic equivalent of Azure's {"role":"system"} message
+                "system": intro_prompt,
+                "messages": messages,
+            }
+
+            if self.debug:
+                print("invoke_model(aws_bedrock) request messages: %s" % messages)
+
+            response = self.client.invoke_model(
+                modelId=self.model,
+                contentType="application/json",
+                accept="application/json",
+                body=json.dumps(request_body),
+            )
+
+            response_body = json.loads(response["body"].read())
+
+            # Extract response text
+            rts = ""
+            if response_body.get("content"):
+                rts = "".join(
+                    block.get("text", "")
+                    for block in response_body["content"]
+                    if block.get("type") == "text"
+                ).strip()
+
+            if self.debug:
+                print("invoke_model(aws_bedrock)\nQ: %s\nA: %s" % (prompt, rts))
+
+            # Append only the user prompt and assistant reply to history (not the file block)
+            self.history.append(prompt_message)
+            self.history.append(
+                {"role": "assistant", "content": response_body.get("content", [])}
+            )
+
+            # Extract token usage
+            usage = response_body.get("usage", {})
+            prompt_tokens = usage.get("input_tokens", 0)
+            completion_tokens = usage.get("output_tokens", 0)
+            total_tokens = prompt_tokens + completion_tokens
+
+            if not usage and self.debug:
+                print(
+                    "Warning: Bedrock API response did not contain usage information.",
+                    file=sys.stderr,
+                )
+
+            return rts, prompt_tokens, completion_tokens, total_tokens
+
+        except Exception as e:
+            error_message = f"AI error (AWS Bedrock): {type(e).__name__}: {e}"
+            print(error_message, file=sys.stderr)
+            return error_message, 0, 0, 0
+
+
 # ---------- Azure provider ----------
 class azure_gateway_provider(ai_provider):
     def __init__(self, parent: api_eda_ai_assist):
@@ -1351,6 +1554,8 @@ class azure_gateway_provider(ai_provider):
 
 
         intro_prompt_message = {"role": "system", "content": intro_prompt}
+# New 2026.02.24
+        message += [intro_prompt_message]
         prompt_message = {"role": "user", "content": prompt}
 
         for each_file in input_file_list:
@@ -1380,7 +1585,7 @@ class azure_gateway_provider(ai_provider):
 
         if file_message:
             message.append({"role": "user", "content": file_message})
-        message += [intro_prompt_message]
+#       message += [intro_prompt_message]
         message += self.history
         message += [prompt_message]
 
@@ -1977,9 +2182,9 @@ def main():
         line = " ".join(sys.argv[1:])
         ai.open_ai_session()
         if ai.provider: # Check if session opened successfully
-            rts, warnings = ai.ask_ai(line)
+            rts = ai.ask_ai(line)
             print(rts)
-            for w in warnings:
+            for w in ai.get_warnings(): 
                 print(f"[warning] {w}")
             ai.print_session_status()
             ai.close_ai_session()
@@ -2022,9 +2227,9 @@ def main():
                     if not ai.provider: # Open session if not already open (e.g., first AI command)
                         ai.open_ai_session()
                     if ai.provider: # Proceed only if session is active
-                        rts, warnings = ai.ask_ai(full_prompt_from_buffer)
+                        rts = ai.ask_ai(full_prompt_from_buffer)
                         print(rts)
-                        for w in warnings:
+                        for w in ai.get_warnings(): 
                             print(f"[warning] {w}")
                         if not ai.provider:
                             return # Handles special hard-limit reached closed session case
@@ -2124,9 +2329,9 @@ def main():
             if not ai.provider: # Open session if not already open (e.g., first AI command)
                 ai.open_ai_session()
             if ai.provider: # Proceed only if session is active
-                rts, warnings = ai.ask_ai(line)
+                rts = ai.ask_ai(line)
                 print(rts)
-                for w in warnings:
+                for w in ai.get_warnings(): 
                     print(f"[warning] {w}")
                 if not ai.provider:
                     return # Handles special hard-limit reached closed session case
