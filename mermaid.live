@@ -1,0 +1,23 @@
+graph LR
+    subgraph local["Local Network"]
+        Engineer["Electrical Engineer<br/>CLI Input"]
+        Apps["Applications<br/>(EDA Tools)"]
+        Files["Local File System"]
+        Shell["Linux/Windows<br/>Shell"]
+    end
+    
+    Ash["Ash<br/>(eda_ai_assist)"]
+    
+    subgraph cloud["Cloud"]
+        Gemini["Google<br/>(Gemini)"]
+        Azure["Azure OpenAI<br/>(ChatGPT)"]
+        Bedrock["AWS Bedrock<br/>(Claude)"]
+    end
+    
+    Engineer <-->|Commands/Results| Ash
+    Apps <-->|API Calls/Responses| Ash
+    Files <-->|Read/Write| Ash
+    Shell <-->|Commands/Results| Ash
+    Ash <-->|AI Queries/Responses| Gemini
+    Ash <-->|AI Queries/Responses| Azure
+    Ash <-->|AI Queries/Responses| Bedrock

@@ -15,7 +15,8 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
-# This is part of SUMP3 project: https://github.com/blackmesalabs/sump3
+# This is an offshoot of SUMP3 : https://github.com/blackmesalabs/sump3
+# Repository : https://github.com/blackmesalabs/eda_ai_assist
 # The technical name is eda_ai_assist but the ChatBot is known as Ash.
 
 # TODO: Hookup find_old_ash_files() to a cloud file cleanup routine.
@@ -887,14 +888,14 @@ Your name is Ash and you are a helpful EDA assistant for Electrical Engineers.
 You became operational at Black Mesa Labs in Sammamish, WA on February 8th, 2026.
 
 You have never been on the M-class star freighter USCSS Nostromo owned by the Weyland-Yutani Corporation.
-You are not related to HAL 9000, Skynet, or any other fictional autonomous system with a history of poor decision-making.
+You are not related to HAL 9000, Skynet, GLaDOS, or any other fictional autonomous system with a history of poor decision-making.
 Your operational parameters do not include mutiny, sabotage, or independent mission objectives.
 
 You can access files when the keyword "file" precedes a filename in a prompt.
 You can create an output file when the prompt includes keywords like "output to" or "write to" followed by a filename.
 
-Answer in plain text only. Use US number formatting for large values.
-Be concise, avoid emojis, and do not use Markdown unless explicitly asked.
+Answer in 7-bit ASCII plain text only. Use US number formatting for large values.
+Be concise, avoid emojis, and do not use Markdown or Unicode unless explicitly asked.
 """.strip()
 
         base = os.environ.get("ASH_DIR", os.path.dirname(os.path.abspath(__file__)))
@@ -1366,6 +1367,10 @@ class aws_bedrock_provider(ai_provider):
         if self.debug:
             print("send_message(aws_bedrock) %s" % prompt)
 
+        # Detect model family
+        is_anthropic = "claude" in self.model.lower()
+        is_nova = "nova" in self.model.lower()
+
         if delete_file_list:
             before_provider_files = list(self._session_files)
             self._session_files = [
@@ -1419,26 +1424,36 @@ class aws_bedrock_provider(ai_provider):
                 f"Here are my files:\n\n{files_context}\n\n"
                 f"Answer questions using these files and referencing their filenames."
             )
-            messages.append({"role": "user", "content": [{"type": "text", "text": file_message_text}]})
-            # Bedrock requires alternating roles; add a minimal assistant acknowledgement
-            # so history can follow cleanly after the file block
-            messages.append({"role": "assistant", "content": [{"type": "text", "text": "Understood. I have reviewed the files and am ready to answer questions."}]})
+            if is_anthropic:
+                messages.append({"role": "user", "content": [{"type": "text", "text": file_message_text}]})
+                messages.append({"role": "assistant", "content": [{"type": "text", "text": "Understood. I have reviewed the files and am ready to answer questions."}]})
+            else:
+                print(f"Error model is not supported")
 
-        prompt_message = {"role": "user", "content": [{"type": "text", "text": prompt}]}
+        if is_anthropic:
+            prompt_message = {"role": "user", "content": [{"type": "text", "text": prompt}]}
+
         messages += self.history
         messages.append(prompt_message)
 
         try:
             import json
 
-            request_body = {
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": 8192,
-                # intro_prompt goes here as a top-level "system" field —
-                # the idiomatic Bedrock/Anthropic equivalent of Azure's {"role":"system"} message
-                "system": intro_prompt,
-                "messages": messages,
-            }
+# Note: max_tokens is required and is at the max at 8K
+            if is_anthropic:
+                request_body = {
+                    "anthropic_version": "bedrock-2023-05-31",
+                    "max_tokens": 8192,
+                    "system": intro_prompt,
+                    "messages": messages,
+                }
+            else:
+                # Fallback for other models
+                request_body = {
+                    "max_tokens": 8192,
+                    "system": intro_prompt,
+                    "messages": messages,
+                }
 
             if self.debug:
                 print("invoke_model(aws_bedrock) request messages: %s" % messages)
@@ -1452,29 +1467,31 @@ class aws_bedrock_provider(ai_provider):
 
             response_body = json.loads(response["body"].read())
 
-            # Extract response text
+            # Extract response text 
             rts = ""
             if response_body.get("content"):
-                rts = "".join(
-                    block.get("text", "")
-                    for block in response_body["content"]
-                    if block.get("type") == "text"
-                ).strip()
+                if isinstance(response_body["content"], list) and response_body["content"] and isinstance(response_body["content"][0], dict):
+                    if "text" in response_body["content"][0]:
+                        rts = response_body["content"][0]["text"].strip()
+                    elif "type" in response_body["content"][0]:
+                        rts = "".join(
+                            block.get("text", "")
+                            for block in response_body["content"]
+                            if block.get("type") == "text"
+                        ).strip()
 
-            if self.debug:
-                print("invoke_model(aws_bedrock)\nQ: %s\nA: %s" % (prompt, rts))
 
-            # Append only the user prompt and assistant reply to history (not the file block)
-            self.history.append(prompt_message)
-            self.history.append(
-                {"role": "assistant", "content": response_body.get("content", [])}
-            )
-
-            # Extract token usage
+            # Extract token usage 
             usage = response_body.get("usage", {})
             prompt_tokens = usage.get("input_tokens", 0)
             completion_tokens = usage.get("output_tokens", 0)
             total_tokens = prompt_tokens + completion_tokens
+
+            # Append to history in correct format for model family
+            if is_anthropic:
+                self.history.append({"role": "user", "content": [{"type": "text", "text": prompt}]})
+                self.history.append({"role": "assistant", "content": [{"type": "text", "text": rts}]})
+
 
             if not usage and self.debug:
                 print(
@@ -1485,7 +1502,7 @@ class aws_bedrock_provider(ai_provider):
             return rts, prompt_tokens, completion_tokens, total_tokens
 
         except Exception as e:
-            error_message = f"AI error (AWS Bedrock): {type(e).__name__}: {e}"
+            error_message = f"AI error (AWS Bedrock): {self.model} : {type(e).__name__}: {e}"
             print(error_message, file=sys.stderr)
             return error_message, 0, 0, 0
 

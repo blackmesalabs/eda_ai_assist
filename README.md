@@ -5,6 +5,8 @@ Ash (AI‑Assisted Shell) wraps around your existing terminal and brings modern 
 
 Ash is a helpful command-line AI assistant for Electrical Engineers who work with large EDA artifacts. It wraps around your existing shell and brings modern AI/LLM capabilities directly into Linux/UNIX terminals and Windows PowerShell. Ash emphasizes clarity, predictability, and operational safety — with strict control over credentials, logging, and multi‑user behavior.
 
+Ash became operational at Black Mesa Labs in Sammamish, WA on February 8th, 2026.
+
 ## Features
 - **AI-Enabled EDA Assistance:** Natural-language processing for EDA file analysis.
 - **Cross-Platform Shell Wrapper:** Works on Windows (PowerShell) and Linux/macOS (bash/zsh/csh).
@@ -25,9 +27,16 @@ Ash is a helpful command-line AI assistant for Electrical Engineers who work wit
 - **Token Usage Monitoring:** Tracks AI token usage per session with warnings at 2,500,000 and 4,000,000 tokens, and automatic session termination at 5,000,000 tokens to prevent runaway costs.
 - **Cost Estimation:** Estimates session costs based on a configurable `site_token_rates.txt`.
 - **Flexible Configuration:** Supports multiple credential delivery paths, including secure encrypted tokens and raw API keys, with site-wide defaults and environment variable overrides.
-- **Provider Abstraction:** Supports Gemini (default), Azure Gateway, and AWS Bedrock models.
+- **Provider Abstraction:** Supports Gemini (default), Azure Gateway, and AWS Bedrock Claude models.
 - **Structured Logging:** Detailed usage logging and per-user accounting.
 - **Operational Safety:** Predictable, auditable behavior; works offline except for model calls.
+
+## Experimental GUI Frontends
+Ash also provides experimental graphical user interfaces for a chatbot-like experience:
+- **ashchat_tk.py**: A Tkinter-based GUI for Linux.
+- **ashchat_wx.py**: A wxPython-based GUI for Windows.
+
+These GUIs are under active development and are intended for interactive chat with file management capabilities.
 
 ## Installation
 Clone the repository and install dependencies:
@@ -35,7 +44,7 @@ Clone the repository and install dependencies:
 ```bash
 python3 -m pip install google-genai openai boto3
 ```
-Ensure the `google-genai` package is installed for Gemini support, `openai` for Azure Gateway support, and `boto3` for AWS Bedrock support.
+Ensure the `google-genai` package is installed for Gemini support, `openai` for Azure Gateway support, and `boto3` for AWS Bedrock support. Additional packages may be required for GUI frontends (e.g., `tkinter` for `ashchat_tk.py` or `wxPython` for `ashchat_wx.py`).
 
 ## API Key Configuration and Environment Variables
 Ash's behavior is configured via environment variables and site files within `ASH_DIR`. Variables are applied in the following precedence: 1) Internal defaults, 2) `site_defaults.txt`, 3) Explicit `ASH_*` user environment variables.
