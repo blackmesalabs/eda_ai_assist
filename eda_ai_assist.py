@@ -393,7 +393,9 @@ class api_eda_ai_assist:
             pass
 
         if cost:
-            print(cost)
+            # Modified: don't print, return for GUI consumption
+            self._warnings.append(cost) # Store cost in warnings for GUI
+            # print(cost) # Removed direct print
 
         # Reset centralized counters after session close
         self.token_cnt_upload = 0
@@ -451,7 +453,7 @@ class api_eda_ai_assist:
             f"Files: {num_ash_files} ({formatted_file_size}) | "
             f"Time: {response_time_str}"
         )
-        print(status_line)
+        print(status_line) # Still prints for non-GUI context. For GUI, this info is returned by get_status_text()
 
     # ---------- AI routing ----------
     def is_ai_request(self, prompt):
@@ -490,6 +492,8 @@ class api_eda_ai_assist:
             "analyze file", "analyze files",
             "summarize file", "summarize files",
             "how many", "how much", "what is", "what's",
+            "input file", "input files", # Added these for explicit GUI file operations
+            "load file", "load files",   # Added these for explicit GUI file operations
         }
 
         NATURAL_LEADING_WORDS = {
@@ -608,18 +612,68 @@ class api_eda_ai_assist:
                     candidate = "unknown"
         return hashlib.sha1(candidate.encode("utf-8")).hexdigest()[:length]
 
+    # ---------- Local file command detector ----------
+    def _is_local_file_command(self, prompt: str) -> bool:
+        """
+        Returns True if the prompt is a short, purely file-management command
+        that should be handled locally without calling the cloud AI.
+        Examples:
+          "ash input file foo.txt"
+          "input files foo.txt, bar.txt"
+          "delete file bar.txt"
+          "ash list files"
+          "list *"
+        """
+        import re as _re
+
+        # Strip leading "ash" keyword if present
+        text = prompt.strip()
+        if text.lower().startswith("ash "):
+            text = text[4:].strip()
+
+        LOCAL_CMD_RE = _re.compile(
+            r"""
+            ^
+            (?:
+                # delete / remove variants
+                (?:delete|remove|rm)\s+(?:file\s+|files\s+)?\S.*
+                |
+                # list variants
+                (?:list)(?:\s+(?:files?|\*))?(?:\s+\S+)?
+                |
+                # input / load / analyze file(s) - file load only, no question
+                (?:input|load|analyze)\s+files?\s+\S.*
+            )
+            $
+            """,
+            _re.IGNORECASE | _re.VERBOSE,
+        )
+
+        return bool(LOCAL_CMD_RE.match(text.strip()))
+
+
     # ---------- AI front-end ----------
-    def ask_ai(self, prompt):
+    def ask_ai(self, prompt) -> str: # Changed return type to str
         self._warnings = []
         cfg = self.cfg
         user_prompt = cfg["ASH_USER_PROMPT"]
         log_dir = cfg["ASH_LOG_DIR"]
 
+        # ------------------------------------------------------------------
+        # Short-circuit: purely local file-management commands never go to AI
+        # ------------------------------------------------------------------
+        # If it's a local command, handle it and return its output immediately.
+        # The output is prefixed for AshChat to recognize as a system message.
+        local_command_output = self.handle_file_commands(prompt.strip())
+        if local_command_output is not None:
+            return f"[system]: {local_command_output}"
+
+
         output_file = self.ai_output_file(prompt)
         if output_file:
             if os.path.exists(output_file):
                 reply = f"Error: output file '{output_file}' already exists."
-                reply += "\nI’m not allowed to delete user files. You’ll need to do that yourself."
+                reply += "\nI'm not allowed to delete user files. You'll need to do that yourself."
                 return reply
 
         input_file_list, delete_file_list = self.ai_input_files(prompt, output_file)
@@ -648,10 +702,11 @@ class api_eda_ai_assist:
         normalized_prompt = custom_prompt
         for file_path in input_file_list:
             basename = os.path.basename(file_path)
+            # Only replace if the full path is found as a literal string in the prompt
+            # This avoids replacing parts of filenames that happen to match basenames
             normalized_prompt = normalized_prompt.replace(file_path, basename)
 
 
-        result = "Fake Response"
         if self.provider:
             result = self.ask_ai_model(normalized_prompt, intro_prompt, input_file_list, delete_file_list)
         else:
@@ -669,14 +724,19 @@ class api_eda_ai_assist:
                     size_str = "unknown size"
                 return f"Created {output_file} ({size_str})"
             except Exception as e:
-                print(f"Error writing to {output_file}: {e}", file=sys.stderr)
-                print(result) # Still print AI response to console if file write fails
+                # print(f"Error writing to {output_file}: {e}", file=sys.stderr) # Removed direct print
+                self._warnings.append(f"Error writing to {output_file}: {e}")
+                return result # Return original AI result despite write error
         else:
             return result
+
+
 
     def ask_ai_model(self, prompt, intro_prompt, input_file_list, delete_file_list):
         if self.debug:
             print("ask_ai_model() %s" % prompt)
+            for each_file in input_file_list:
+                print("input_file_list: %s" % str( each_file ) );
 
         start_time = time.time()
         # The provider returns (text_response, prompt_tokens, completion_tokens, total_tokens)
@@ -692,7 +752,8 @@ class api_eda_ai_assist:
         self.token_cnt_total += total_tokens
 
         # Enforce new token limit strategy
-        self._warnings = []
+        # _warnings are also handled by the close_ai_session for costs.
+        # _warnings are stored here then retrieved by get_warnings()
         if self.token_cnt_total >= ASH_TOKEN_LIMIT:
             # Hard limit: immediate termination
             self._warnings.append(
@@ -707,6 +768,7 @@ class api_eda_ai_assist:
             )
 
             # Close the session (resets counters and provider)
+            # This call will add cost warnings to self._warnings
             self.close_ai_session()
 
             # Return a termination message AND the warnings
@@ -795,7 +857,7 @@ class api_eda_ai_assist:
         import re as _re
         import os as _os
 
-        TRIG_RE = _re.compile(r"\b(?:file|files|analyze|load)\b", _re.IGNORECASE)
+        TRIG_RE = _re.compile(r"\b(?:file|files|analyze|load|input)\b", _re.IGNORECASE) # Added 'input'
         DEL_TRIG_RE = _re.compile(r"\b(?:delete|remove|rm)\b(?:\s+(?:file|files))?", _re.IGNORECASE)
 
         TOKEN_RE = _re.compile(
@@ -867,13 +929,12 @@ class api_eda_ai_assist:
                 if kind == "del":
                     if candidate_expanded in delete_seen:
                         continue
-                    if not must_exist or _os.path.isfile(candidate_expanded): # Original commented logic
+                    if not must_exist or _os.path.isfile(candidate_expanded):
                         delete_found.append(candidate_expanded)
                         delete_seen.add(candidate_expanded)
                 else:
                     if candidate_expanded in seen:
                         continue
-#                   if not must_exist or _os.path.exists(candidate_expanded): # Original commented logic
                     if not must_exist or _os.path.isfile(candidate_expanded):
                         found.append(candidate_expanded)
                         seen.add(candidate_expanded)
@@ -894,8 +955,9 @@ Your operational parameters do not include mutiny, sabotage, or independent miss
 You can access files when the keyword "file" precedes a filename in a prompt.
 You can create an output file when the prompt includes keywords like "output to" or "write to" followed by a filename.
 
-Answer in 7-bit ASCII plain text only. Use US number formatting for large values.
-Be concise, avoid emojis, and do not use Markdown or Unicode unless explicitly asked.
+Answer in ASCII. Do not use unicode unless explicitly asked.
+Use US number formatting for large values.
+Be concise, avoid emojis, and do not use Markdown unless explicitly asked.
 """.strip()
 
         base = os.environ.get("ASH_DIR", os.path.dirname(os.path.abspath(__file__)))
@@ -917,7 +979,8 @@ Be concise, avoid emojis, and do not use Markdown or Unicode unless explicitly a
     def load_site_secret_key(self):
         ash_dir = os.environ.get("ASH_DIR")
         if not ash_dir:
-            print("Error: ASH_DIR environment variable is not set.", file=sys.stderr)
+            # print("Error: ASH_DIR environment variable is not set.", file=sys.stderr) # Removed direct print
+            self._warnings.append("Error: ASH_DIR environment variable is not set.")
             return None
 
         key_path = os.path.join(ash_dir, "site_key.txt")
@@ -925,14 +988,17 @@ Be concise, avoid emojis, and do not use Markdown or Unicode unless explicitly a
             with open(key_path, "r") as f:
                 key = f.read().strip()
                 if not key:
-                    print("Error: site_key.txt is empty.", file=sys.stderr)
+                    # print("Error: site_key.txt is empty.", file=sys.stderr) # Removed direct print
+                    self._warnings.append("Error: site_key.txt is empty.")
                     return None
                 return key
         except FileNotFoundError:
-            print(f"Error: site_key.txt not found in {ash_dir}.", file=sys.stderr)
+            # print(f"Error: site_key.txt not found in {ash_dir}.", file=sys.stderr) # Removed direct print
+            self._warnings.append(f"Error: site_key.txt not found in {ash_dir}.")
             return None
         except Exception as e:
-            print(f"Error reading site_key.txt: {e}", file=sys.stderr)
+            # print(f"Error reading site_key.txt: {e}", file=sys.stderr) # Removed direct print
+            self._warnings.append(f"Error reading site_key.txt: {e}")
             return None
 
     # ---------- Config ----------
@@ -991,7 +1057,8 @@ Be concise, avoid emojis, and do not use Markdown or Unicode unless explicitly a
                                 val = val[1:-1]
                             site_defaults[key] = val
             except Exception as e:
-                print(f"Warning: could not read site_defaults.txt: {e}", file=sys.stderr)
+                # print(f"Warning: could not read site_defaults.txt: {e}", file=sys.stderr) # Removed direct print
+                self._warnings.append(f"Warning: could not read site_defaults.txt: {e}")
 
         for key, val in site_defaults.items():
             cfg[key] = val
@@ -1026,7 +1093,8 @@ Be concise, avoid emojis, and do not use Markdown or Unicode unless explicitly a
         try:
             username, cipher_hex, sig = token.split("|")
         except ValueError:
-            print("Error: Invalid token format.", file=sys.stderr)
+            # print("Error: Invalid token format.", file=sys.stderr) # Removed direct print
+            self._warnings.append("Error: Invalid token format.")
             return None, None
 
         key_bytes = secret_key.encode()
@@ -1034,7 +1102,8 @@ Be concise, avoid emojis, and do not use Markdown or Unicode unless explicitly a
         expected = hmac.new(key_bytes, payload.encode(), _hashlib.sha256).hexdigest()
 
         if not hmac.compare_digest(expected, sig):
-            print("Error: Invalid token signature.", file=sys.stderr)
+            # print("Error: Invalid token signature.", file=sys.stderr) # Removed direct print
+            self._warnings.append("Error: Invalid token signature.")
             return None, None
 
         cipher = bytes.fromhex(cipher_hex)
@@ -1078,7 +1147,9 @@ Be concise, avoid emojis, and do not use Markdown or Unicode unless explicitly a
             with open(filename, "a") as f:
                 f.write(line)
         except Exception as e:
-            print(f"Warning: Could not write to query usage log {filename}: {e}", file=sys.stderr)
+            # print(f"Warning: Could not write to query usage log {filename}: {e}", file=sys.stderr) # Removed direct print
+            self._warnings.append(f"Warning: Could not write to query usage log {filename}: {e}")
+
 
     def log_user_totals(self, filename, model, api_key, upload_bytes, download_bytes, identity):
         key_id = self.obfuscate_key(api_key)
@@ -1134,7 +1205,8 @@ Be concise, avoid emojis, and do not use Markdown or Unicode unless explicitly a
                     )
                     f.write(line)
         except Exception as e:
-            print(f"Warning: Could not write to user totals log {filename}: {e}", file=sys.stderr)
+            # print(f"Warning: Could not write to user totals log {filename}: {e}", file=sys.stderr) # Removed direct print
+            self._warnings.append(f"Warning: Could not write to user totals log {filename}: {e}")
 
     def ash_report_session_cost(self, model, ash_dir, prompt_tokens, completion_tokens):
         import re as _re
@@ -1171,7 +1243,8 @@ Be concise, avoid emojis, and do not use Markdown or Unicode unless explicitly a
                         continue
                     m = rate_line_re.match(line)
                     if not m:
-                        print(f"Warning: Unrecognized rates line at {rates_path}:{lineno}: {raw!r}", file=sys.stderr)
+                        # print(f"Warning: Unrecognized rates line at {rates_path}:{lineno}: {raw!r}", file=sys.stderr) # Removed direct print
+                        self._warnings.append(f"Warning: Unrecognized rates line at {rates_path}:{lineno}: {raw!r}")
                         continue
                     mdl = m.group("model").strip().lower()
 
@@ -1182,7 +1255,8 @@ Be concise, avoid emojis, and do not use Markdown or Unicode unless explicitly a
                     out_per_m = _parse_money(m.group("output"))
                     rates[mdl] = (in_per_m, out_per_m)
         except Exception as e:
-            print(f"Warning: Error reading site_token_rates.txt: {e}", file=sys.stderr)
+            # print(f"Warning: Error reading site_token_rates.txt: {e}", file=sys.stderr) # Removed direct print
+            self._warnings.append(f"Warning: Error reading site_token_rates.txt: {e}")
             return ""
 
         if not rates:
@@ -1190,7 +1264,8 @@ Be concise, avoid emojis, and do not use Markdown or Unicode unless explicitly a
 
         key = model.lower()
         if key not in rates:
-            print(f"Warning: No token rates found for model '{model}' in {rates_path}.", file=sys.stderr)
+            # print(f"Warning: No token rates found for model '{model}' in {rates_path}.", file=sys.stderr) # Removed direct print
+            self._warnings.append(f"Warning: No token rates found for model '{model}' in {rates_path}.")
             return ""
 
         in_per_million, out_per_million = rates[key]
@@ -1208,80 +1283,140 @@ Be concise, avoid emojis, and do not use Markdown or Unicode unless explicitly a
         return report
 
     # ---------- File commands ----------
-    def delete_session_file(self, filename: str):
+    def delete_session_file(self, filename: str) -> str: # Modified return type
+        output = []
         if filename in self.session_file_list:
             self.session_file_list.remove(filename)
+            output.append(f"Unloaded local session file: {os.path.basename(filename)}")
+        else:
+            output.append(f"Warning: File not found in session: {os.path.basename(filename)}")
+            # No cloud deletion attempt if not in local session list
 
         if self.provider and hasattr(self.provider, "delete_file"):
             try:
-                self.provider.delete_file(filename) # Provider handles its own cloud metadata
+                provider_output = self.provider.delete_file(filename) # Provider handles its own cloud metadata
+                if provider_output:
+                    output.append(f"Provider reports: {provider_output}")
             except Exception as e:
-                print(f"Warning: could not delete cloud file {filename}: {e}", file=sys.stderr)
+                # print(f"Warning: could not delete cloud file {filename}: {e}", file=sys.stderr) # Removed direct print
+                self._warnings.append(f"Warning: could not delete cloud file {filename}: {e}")
+                output.append(f"Warning: Failed to delete cloud file {os.path.basename(filename)}: {e}")
+        else:
+            output.append(f"Note: No cloud provider or cloud file deletion method available for {os.path.basename(filename)}.")
+        
+        return "\n".join(output)
 
-        print(f"Deleted {filename}")
-
-    def handle_file_commands(self, line: str) -> bool:
+    def handle_file_commands(self, line: str) -> Optional[str]: # Modified return type
         tokens = line.split()
+        output_buffer: List[str] = []
+
         if not tokens:
-            return False
+            return None
 
         cmd = tokens[0].lower()
 
+        # Input / Load file command
+        if cmd in ("input", "load"):
+            if len(tokens) >= 2 and tokens[1].lower() == "file":
+                if len(tokens) < 3:
+                    output_buffer.append("Usage: input/load file <path>")
+                    return "\n".join(output_buffer)
+                
+                file_path = " ".join(tokens[2:]) # Rejoin paths that might have spaces
+                file_path = os.path.expanduser(os.path.expandvars(file_path.strip('"\'')))
+
+                if not os.path.exists(file_path):
+                    output_buffer.append(f"Error: File not found: {file_path}")
+                    return "\n".join(output_buffer)
+
+                if file_path not in self.session_file_list:
+                    self.session_file_list.append(file_path)
+                    output_buffer.append(f"Loaded file into session: {os.path.basename(file_path)}")
+                else:
+                    output_buffer.append(f"File already in session: {os.path.basename(file_path)}")
+                return "\n".join(output_buffer)
+            # Handle "input files <path1>, <path2>"
+            elif len(tokens) >= 2 and tokens[1].lower() == "files":
+                file_paths_str = " ".join(tokens[2:])
+                # Robustly split by comma and handle quotes
+                file_candidates = shlex.split(file_paths_str.replace(',', ' '))
+                
+                for candidate in file_candidates:
+                    file_path = os.path.expanduser(os.path.expandvars(candidate.strip('"\'')))
+                    if not os.path.exists(file_path):
+                        output_buffer.append(f"Error: File not found: {file_path}")
+                        continue
+                    if file_path not in self.session_file_list:
+                        self.session_file_list.append(file_path)
+                        output_buffer.append(f"Loaded file into session: {os.path.basename(file_path)}")
+                    else:
+                        output_buffer.append(f"File already in session: {os.path.basename(file_path)}")
+                return "\n".join(output_buffer) if output_buffer else "No files processed."
+
+
         # DELETE
-        if cmd == "delete":
+        if cmd == "delete" or cmd == "remove" or cmd == "rm":
             if len(tokens) == 2 and tokens[1] == "*":
                 if not self.session_file_list:
-                    print("No session files to delete.")
-                    return True
-                # Iterate on a copy as list is modified during iteration
-                for f in list(self.session_file_list):
-                    self.delete_session_file(f)
-                print("Deleted all session files.")
-                return True
+                    output_buffer.append("No session files to delete.")
+                    return "\n".join(output_buffer)
+                
+                files_to_delete_in_session = list(self.session_file_list) # Operate on a copy
+                for f_path in files_to_delete_in_session:
+                    output_buffer.append(self.delete_session_file(f_path)) # Capture individual delete outputs
+                output_buffer.append("Deleted all session files.")
+                return "\n".join(output_buffer)
 
             if len(tokens) >= 2:
-                if tokens[1] == "file":
+                target_token_start_idx = 1
+                if tokens[1].lower() == "file" or tokens[1].lower() == "files":
+                    target_token_start_idx = 2
                     if len(tokens) < 3:
-                        print("Usage: delete file <name>")
-                        return True
-                    target = tokens[2]
-                else:
-                    target = tokens[1]
+                        output_buffer.append("Usage: delete file <name>")
+                        return "\n".join(output_buffer)
+                
+                target_name = " ".join(tokens[target_token_start_idx:]).strip('"\'')
 
-                matches = [f for f in self.session_file_list if f.endswith(target)]
+                # Find all matching files by basename (or full path if target is a path)
+                matches = []
+                for f_path in self.session_file_list:
+                    if target_name == f_path or os.path.basename(f_path) == target_name:
+                        matches.append(f_path)
+
                 if not matches:
-                    print(f"No such file in session: {target}")
-                    return True
+                    output_buffer.append(f"No such file in session: {target_name}")
+                    return "\n".join(output_buffer)
 
-                for f in matches:
-                    self.delete_session_file(f)
+                for f_path in matches:
+                    output_buffer.append(self.delete_session_file(f_path))
+                
+                return "\n".join(output_buffer)
 
-                return True
-
-            return False
+            return None # Not a recognized delete command pattern
 
         # LIST
         if cmd == "list":
-            if len(tokens) == 1 or tokens[1] in ("files", "*"):
+            if len(tokens) == 1 or tokens[1].lower() in ("files", "*"):
                 if not self.session_file_list:
-                    print("No session files.")
-                    return True
-                for f in self.session_file_list:
-                    print(f)
-                return True
+                    output_buffer.append("No session files.")
+                    return "\n".join(output_buffer)
+                output_buffer.append("Current session files:")
+                for f_path in sorted(self.session_file_list):
+                    output_buffer.append(f"- {f_path}")
+                return "\n".join(output_buffer)
 
-            target = tokens[1]
-            matches = [f for f in self.session_file_list if f.endswith(target)]
+            target = " ".join(tokens[1:]).strip('"\'')
+            matches = [f_path for f_path in self.session_file_list if target == f_path or os.path.basename(f_path) == target]
             if not matches:
-                print(f"No such file in session: {target}")
-                return True
+                output_buffer.append(f"No such file in session: {target}")
+                return "\n".join(output_buffer)
 
-            for f in matches:
-                print(f)
+            output_buffer.append(f"Matching session files for '{target}':")
+            for f_path in sorted(matches):
+                output_buffer.append(f"- {f_path}")
+            return "\n".join(output_buffer)
 
-            return True
-
-        return False
+        return None # Command not recognized as a local file command
 
 
 # ---------- Provider base ----------
@@ -1299,9 +1434,10 @@ class ai_provider:
         """
         raise NotImplementedError
 
-    def delete_file(self, local_path: str):
-        """Optional: delete a cloud file corresponding to local_path."""
-        raise NotImplementedError
+    def delete_file(self, local_path: str) -> Optional[str]: # Modified return type
+        """Optional: delete a cloud file corresponding to local_path. Returns status string."""
+        # Default implementation for providers without explicit cloud file management
+        return f"No cloud deletion available for '{os.path.basename(local_path)}' with this provider."
 
 
 # ---------- AWS Bedrock provider ----------
@@ -1348,18 +1484,25 @@ class aws_bedrock_provider(ai_provider):
         self.history = []
         self.client = None
 
-    def delete_file(self, local_path: str):
+    def delete_file(self, local_path: str) -> str: # Modified return type
         before = list(self._session_files)
+        # Filter out the file to be deleted from the provider's internal list
         self._session_files = [
             item for item in self._session_files if item[0] != local_path
         ]
+        removed_count = len(before) - len(self._session_files)
+        
+        # It's important that parent.session_file_list is updated by api_eda_ai_assist.delete_session_file
+        # so this method only needs to care about its own _session_files.
+
         if self.debug:
             removed = [p for p, _ in before if p not in [q for q, _ in self._session_files]]
             if removed:
-                print(f"aws_bedrock_provider: removed from _session_files: {removed}")
-        self.parent.session_file_list = [
-            p for p in self.parent.session_file_list if p != local_path
-        ]
+                return f"aws_bedrock_provider: removed from _session_files: {removed}"
+            else:
+                return f"aws_bedrock_provider: file {os.path.basename(local_path)} not found in _session_files."
+        
+        return f"File {os.path.basename(local_path)} removed from Bedrock session tracking." if removed_count > 0 else f"File {os.path.basename(local_path)} not tracked by Bedrock session."
 
     def send_message(
         self, prompt, intro_prompt, input_file_list, delete_file_list
@@ -1369,22 +1512,17 @@ class aws_bedrock_provider(ai_provider):
 
         # Detect model family
         is_anthropic = "claude" in self.model.lower()
-        is_nova = "nova" in self.model.lower()
+        # is_nova = "nova" in self.model.lower() # not explicitly used for different pathing
 
         if delete_file_list:
-            before_provider_files = list(self._session_files)
-            self._session_files = [
-                item for item in self._session_files if item[0] not in delete_file_list
-            ]
-            if self.debug:
-                removed = [p for p, _ in before_provider_files if p not in [q for q, _ in self._session_files]]
-                if removed:
-                    print(f"aws_bedrock_provider: removed from _session_files (due to prompt): {removed}")
-            self.parent.session_file_list = [
-                p for p in self.parent.session_file_list if p not in delete_file_list
-            ]
+            for path_to_delete in delete_file_list:
+                # The delete_file method updates _session_files and parent.session_file_list
+                _ = self.delete_file(path_to_delete)
 
-        # Register any new files into the session tracking list
+        # Register any new files into the session tracking list.
+        # This adds to the provider's _session_files, which in turn populates parent.session_file_list
+        # via the handle_file_commands -> delete_session_file flow.
+        # Ensure parent.session_file_list is up-to-date here too.
         for each_file in input_file_list:
             if each_file not in self.parent.session_file_list:
                 self.parent.session_file_list.append(each_file)
@@ -1411,10 +1549,15 @@ class aws_bedrock_provider(ai_provider):
                         f"=== FILE: {os.path.basename(each_file)} ===\n{content}\n"
                     )
                 except Exception as e:
-                    print(f"Error reading file '{each_file}': {e}", file=sys.stderr)
+                    # print(f"Error reading file '{each_file}': {e}", file=sys.stderr) # Removed direct print
+                    self.parent._warnings.append(f"Error reading file '{each_file}': {e}")
+            else:
+                # print(f"Error reading file '{each_file}'") # Removed direct print
+                self.parent._warnings.append(f"Error: File '{each_file}' does not exist on local disk.")
+
 
         # Assemble messages in the same order as azure_gateway_provider:
-        # [file content block] → [history] → [current user prompt]
+        # [file content block] -> [history] -> [current user prompt]
         # The intro_prompt is passed separately as the Bedrock "system" parameter.
         messages = []
 
@@ -1428,12 +1571,16 @@ class aws_bedrock_provider(ai_provider):
                 messages.append({"role": "user", "content": [{"type": "text", "text": file_message_text}]})
                 messages.append({"role": "assistant", "content": [{"type": "text", "text": "Understood. I have reviewed the files and am ready to answer questions."}]})
             else:
-                print(f"Error model is not supported")
+                # For non-Anthropic, prepend file context to user prompt if no direct content type support
+                prompt = file_message_text + "\n\n" + prompt
 
         if is_anthropic:
             prompt_message = {"role": "user", "content": [{"type": "text", "text": prompt}]}
+        else: # Generic fallback for other models, assuming text-only input
+            prompt_message = {"role": "user", "content": prompt}
 
-        messages += self.history
+
+        messages.extend(self.history) # Use extend instead of += to avoid shallow copy issues
         messages.append(prompt_message)
 
         try:
@@ -1448,11 +1595,18 @@ class aws_bedrock_provider(ai_provider):
                     "messages": messages,
                 }
             else:
-                # Fallback for other models
+                # Fallback for other models. Assume generic text-only chat.
+                # Many Bedrock models (e.g. Cohere, AI21) don't use 'system' role
+                # or have different message formats. This is a very basic fallback.
+                # For more robustness, model-specific logic would be needed.
+                messages_for_other_models = []
+                if intro_prompt:
+                    messages_for_other_models.append({"role": "system", "content": intro_prompt})
+                messages_for_other_models.extend(messages) # Add existing messages (history + current prompt)
+
                 request_body = {
                     "max_tokens": 8192,
-                    "system": intro_prompt,
-                    "messages": messages,
+                    "messages": messages_for_other_models,
                 }
 
             if self.debug:
@@ -1479,31 +1633,45 @@ class aws_bedrock_provider(ai_provider):
                             for block in response_body["content"]
                             if block.get("type") == "text"
                         ).strip()
+            elif response_body.get("completion"): # Some older Bedrock models like original Claude
+                rts = response_body["completion"].strip()
+            elif response_body.get("generations") and response_body["generations"][0].get("text"): # Cohere Command
+                rts = response_body["generations"][0]["text"].strip()
+            elif response_body.get("results") and response_body["results"][0].get("outputText"): # AI21 Jurassic
+                rts = response_body["results"][0]["outputText"].strip()
 
 
             # Extract token usage 
-            usage = response_body.get("usage", {})
-            prompt_tokens = usage.get("input_tokens", 0)
-            completion_tokens = usage.get("output_tokens", 0)
+            # This part is highly model-dependent. Using generic keys if available.
+            prompt_tokens = usage.get("input_tokens", 0) if (usage := response_body.get("usage", {})) else 0
+            completion_tokens = usage.get("output_tokens", 0) if usage else 0
+            # Anthropic models sometimes have token counts directly in the top-level response
+            if not prompt_tokens and "prompt_tokens" in response_body:
+                prompt_tokens = response_body["prompt_tokens"]
+            if not completion_tokens and "completion_tokens" in response_body:
+                completion_tokens = response_body["completion_tokens"]
+            
             total_tokens = prompt_tokens + completion_tokens
 
             # Append to history in correct format for model family
             if is_anthropic:
                 self.history.append({"role": "user", "content": [{"type": "text", "text": prompt}]})
                 self.history.append({"role": "assistant", "content": [{"type": "text", "text": rts}]})
-
+            else: # generic fallback
+                self.history.append({"role": "user", "content": prompt})
+                self.history.append({"role": "assistant", "content": rts})
 
             if not usage and self.debug:
-                print(
-                    "Warning: Bedrock API response did not contain usage information.",
-                    file=sys.stderr,
+                self.parent._warnings.append(
+                    "Warning: Bedrock API response did not contain usage information."
                 )
 
             return rts, prompt_tokens, completion_tokens, total_tokens
 
         except Exception as e:
             error_message = f"AI error (AWS Bedrock): {self.model} : {type(e).__name__}: {e}"
-            print(error_message, file=sys.stderr)
+            # print(error_message, file=sys.stderr) # Removed direct print
+            self.parent._warnings.append(error_message) # Store error as warning
             return error_message, 0, 0, 0
 
 
@@ -1539,42 +1707,37 @@ class azure_gateway_provider(ai_provider):
         self._session_files.clear() # Clear internal file list on close
         self.history.clear() # Clear chat history as well
 
-    def delete_file(self, local_path: str):
+    def delete_file(self, local_path: str) -> str: # Modified return type
         # For Azure, "cloud files" are just included in prompt content; nothing to delete remotely.
         # We only need to drop them from our internal list.
         before = list(self._session_files)
         self._session_files = [item for item in self._session_files if item[0] != local_path]
+        removed_count = len(before) - len(self._session_files)
+
         if self.debug:
             removed = [p for p, _ in before if p not in [q for q, _ in self._session_files]]
             if removed:
-                print(f"azure_gateway_provider: removed from _session_files: {removed}")
-        # Also update parent session file list
-        self.parent.session_file_list = [p for p in self.parent.session_file_list if p != local_path]
+                return f"azure_gateway_provider: removed from _session_files: {removed}"
+            else:
+                return f"azure_gateway_provider: file {os.path.basename(local_path)} not found in _session_files."
+        
+        return f"File {os.path.basename(local_path)} removed from Azure session tracking." if removed_count > 0 else f"File {os.path.basename(local_path)} not tracked by Azure session."
 
 
     def send_message(self, prompt, intro_prompt, input_file_list, delete_file_list) -> Tuple[str, int, int, int]:
-        message = []
+        message_parts = [] # Collect content for current user prompt
         file_blocks = []
-        file_message = None
 
         if delete_file_list:
-            # Update provider's internal list of files and parent's list
-            before_provider_files = list(self._session_files)
-            self._session_files = [item for item in self._session_files if item[0] not in delete_file_list]
-            if self.debug:
-                removed_provider = [p for p, _ in before_provider_files if p not in [q for q, _ in self._session_files]]
-                if removed_provider:
-                    print(f"azure_gateway_provider: removed from _session_files (due to prompt): {removed_provider}")
-            # The parent's list should also be updated by the api_eda_ai_assist.delete_session_file if called directly.
-            # If AI generates a delete request, we update it here.
-            self.parent.session_file_list = [p for p in self.parent.session_file_list if p not in delete_file_list]
-
+            for path_to_delete in delete_file_list:
+                # The delete_file method updates _session_files and parent.session_file_list
+                _ = self.delete_file(path_to_delete)
 
         intro_prompt_message = {"role": "system", "content": intro_prompt}
-# New 2026.02.24
-        message += [intro_prompt_message]
-        prompt_message = {"role": "user", "content": prompt}
+        # New 2026.02.24
+        messages = [intro_prompt_message]
 
+        # Register any new files into the session tracking list
         for each_file in input_file_list:
             if each_file not in self.parent.session_file_list:
                 self.parent.session_file_list.append(each_file)
@@ -1595,24 +1758,31 @@ class azure_gateway_provider(ai_provider):
                 with open(each_file, "r", encoding="utf-8") as f:
                     content = f.read()
                 file_blocks.append(f"=== FILE: {os.path.basename(each_file)} ===\n{content}\n")
+            else:
+                # print(f"Error reading file '{each_file}'") # Removed direct print
+                self.parent._warnings.append(f"Error: File '{each_file}' does not exist on local disk.")
 
         files_context = "\n".join(file_blocks)
         if self._session_files:
-            file_message = f"Here are my files:\n\n{files_context}\n\nAnswer questions using these files and referencing their filenames."
+            message_parts.append(f"Here are my files:\n\n{files_context}\n\nAnswer questions using these files and referencing their filenames.")
 
-        if file_message:
-            message.append({"role": "user", "content": file_message})
-#       message += [intro_prompt_message]
-        message += self.history
-        message += [prompt_message]
+        message_parts.append(prompt) # Add the actual user prompt
+
+        # Combine all parts into a single user message for the current turn
+        combined_user_content = "\n".join(message_parts)
+        prompt_message = {"role": "user", "content": combined_user_content}
+        
+        messages.extend(self.history) # Use extend
+        messages.append(prompt_message)
 
         try:
-            response = self.chat.completions.create(model=self.model, messages=message)
+            response = self.chat.completions.create(model=self.model, messages=messages) # Use 'messages' list
             answer = response.choices[0].message.content
             if self.debug:
-                print(message)
+                print(messages)
 
-            self.history.append(prompt_message)
+            # Append only the current turn's actual user prompt and assistant response to history
+            self.history.append({"role": "user", "content": prompt}) # Only the user's specific text
             self.history.append({"role": "assistant", "content": answer})
 
             # Extract raw usage numbers
@@ -1624,12 +1794,15 @@ class azure_gateway_provider(ai_provider):
                 completion_tokens = response.usage.completion_tokens
                 total_tokens = response.usage.total_tokens
             elif self.debug:
-                print("Warning: Azure API response did not contain usage information.", file=sys.stderr)
+                # print("Warning: Azure API response did not contain usage information.", file=sys.stderr) # Removed direct print
+                self.parent._warnings.append("Warning: Azure API response did not contain usage information.")
+
 
             return answer, prompt_tokens, completion_tokens, total_tokens
         except Exception as e:
             error_message = f"AI error (Azure): {type(e).__name__}: {e}"
-            print(error_message, file=sys.stderr)
+            # print(error_message, file=sys.stderr) # Removed direct print
+            self.parent._warnings.append(error_message) # Store error as warning
             return error_message, 0, 0, 0 # Return 0 tokens on error
 
 
@@ -1671,30 +1844,41 @@ class gemini_provider(ai_provider):
                     print(f"File {local_path} deleted successfully from Gemini Files API.")
             except Exception as e:
                 if self.debug:
-                    print(f"Warning: Failed to delete {local_path} (cloud name {uploaded_file_obj.name}) from Gemini Files API: {e}", file=sys.stderr)
+                    # print(f"Warning: Failed to delete {local_path} (cloud name {uploaded_file_obj.name}) from Gemini Files API: {e}", file=sys.stderr) # Removed direct print
+                    self.parent._warnings.append(f"Warning: Failed to delete {local_path} (cloud name {uploaded_file_obj.name}) from Gemini Files API: {e}")
+
         self._session_files.clear()
         self.chat = None # Invalidate chat object
 
-    def delete_file(self, local_path: str):
+    def delete_file(self, local_path: str) -> str: # Modified return type
         client = self.client
         remaining = []
         found_and_deleted = False
+        output_messages = []
+
         for lp, obj in self._session_files:
             if lp == local_path:
                 try:
                     client.files.delete(name=obj.name)
                     if self.debug:
-                        print(f"Deleted cloud file {obj.display_name} (local: {lp}) via Gemini API.")
+                        output_messages.append(f"Deleted cloud file {obj.display_name} (local: {lp}) via Gemini API.")
+                    else:
+                        output_messages.append(f"Cloud file {os.path.basename(lp)} deleted from Gemini.")
                     found_and_deleted = True
                 except Exception as e:
                     if self.debug:
-                        print(f"Warning: Failed to delete cloud file {obj.display_name} (local: {lp}): {e}", file=sys.stderr)
+                        output_messages.append(f"Warning: Failed to delete cloud file {obj.display_name} (local: {lp}): {e}")
+                    else:
+                        output_messages.append(f"Warning: Failed to delete cloud file {os.path.basename(lp)}: {e}")
                     remaining.append((lp, obj)) # If deletion fails, keep it in internal list
             else:
                 remaining.append((lp, obj))
         self._session_files = remaining
-        if found_and_deleted:
-            self.parent.session_file_list = [p for p in self.parent.session_file_list if p != local_path]
+        # The parent.session_file_list is updated by api_eda_ai_assist.delete_session_file, so no need here.
+
+        if not found_and_deleted and not output_messages:
+            return f"File {os.path.basename(local_path)} not tracked by Gemini session."
+        return "\n".join(output_messages)
 
 
     def send_message(self, prompt, intro_prompt, input_file_list, delete_file_list) -> Tuple[str, int, int, int]:
@@ -1704,15 +1888,17 @@ class gemini_provider(ai_provider):
         chat = self.chat
 
         if delete_file_list:
-            for path in delete_file_list:
-                self.delete_file(path) # This updates both provider and parent's session_file_list
+            for path_to_delete in delete_file_list:
+                # This call updates _session_files and parent.session_file_list
+                _ = self.delete_file(path_to_delete)
 
         for each_file in input_file_list:
             if each_file not in self.parent.session_file_list:
                 self.parent.session_file_list.append(each_file)
             if not any(each_file == item[0] for item in self._session_files):
                 if not os.path.exists(each_file):
-                    print(f"Warning: Attempted to upload non-existent file: {each_file}", file=sys.stderr)
+                    # print(f"Warning: Attempted to upload non-existent file: {each_file}", file=sys.stderr) # Removed direct print
+                    self.parent._warnings.append(f"Warning: Attempted to upload non-existent file: {each_file}")
                     continue # Skip this file
 
                 if self.debug:
@@ -1727,7 +1913,8 @@ class gemini_provider(ai_provider):
                         print(f"Uploaded file '{each_file}' as: {uploaded_file.name}")
                     self._session_files.append((each_file, uploaded_file))
                 except Exception as e:
-                    print(f"Error uploading file '{each_file}' to Gemini: {e}", file=sys.stderr)
+                    # print(f"Error uploading file '{each_file}' to Gemini: {e}", file=sys.stderr) # Removed direct print
+                    self.parent._warnings.append(f"Error uploading file '{each_file}' to Gemini: {e}")
 
 
         contents = []
@@ -1759,13 +1946,16 @@ class gemini_provider(ai_provider):
                 prompt_tokens = response.usage_metadata.prompt_token_count
                 completion_tokens = response.usage_metadata.candidates_token_count
             elif self.debug:
-                print("Warning: Gemini API response did not contain usage information.", file=sys.stderr)
+                # print("Warning: Gemini API response did not contain usage information.", file=sys.stderr) # Removed direct print
+                self.parent._warnings.append("Warning: Gemini API response did not contain usage information.")
+
 
             return rts, prompt_tokens, completion_tokens, total_tokens
         except Exception as e:
             error_message = f"AI error (Gemini): {type(e).__name__}: {e}"
-            print(error_message, file=sys.stderr)
-            return error_message, 0, 0, 0 # Return 0 tokens on error
+            # print(error_message, file=sys.stderr) # Removed direct print
+            self.parent._warnings.append(error_message) # Store error as warning
+            return error_message, 0, 0, 0
 
 
 # ---------- Platform / shell ----------
@@ -2029,7 +2219,7 @@ def _init_readline():
             executables_cache = get_path_executables()
             
             # Add builtin commands for completion
-            BUILTIN_COMMANDS = ["cd", "exit", "quit", "history", "status", "flush", "restart", "list", "delete"]
+            BUILTIN_COMMANDS = ["cd", "exit", "quit", "history", "status", "flush", "restart", "list", "delete", "input", "load"] # Added input, load
             
             def complete(text, state):
                 buffer = readline.get_line_buffer()

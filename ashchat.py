@@ -1,8 +1,29 @@
+#!/usr/bin/env python3
+########################################################################
+# Copyright (C) 2026  Kevin M. Hubbard BlackMesaLabs
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+#
+# This is an offshoot of SUMP3 : https://github.com/blackmesalabs/sump3
+# Repository : https://github.com/blackmesalabs/eda_ai_assist
+# The technical name is eda_ai_assist but the ChatBot is known as Ash.
+########################################################################
 import sys
 import os
 import threading
 import queue
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 
 # Conditional imports for GUI toolkits
 if sys.platform.startswith("win32"):
@@ -44,8 +65,12 @@ class AshChatCore:
             sys.exit(1)
 
         self.current_model_nickname = self._get_current_model_nickname()
-        self.loaded_files: List[str] = []
+        # Reinstated local loaded_files list to manage GUI display and prompt construction
+        self.loaded_files: List[str] = [] 
         self.response_queue = queue.Queue()
+
+        # Initial population of loaded files will be triggered by GUI after setup,
+        # so removed the direct call here.
 
     def _load_model_config(self) -> Dict:
         """Load model configuration from site_model_list.txt"""
@@ -109,44 +134,50 @@ class AshChatCore:
             self.gui_callbacks["update_title"](self.ai.cfg.get("ASH_PROVIDER", "unknown"), self.ai.cfg.get("ASH_MODEL", "unknown"))
             self.gui_callbacks["append_chat"]("system", f"Switched to model: {nickname}")
             self.gui_callbacks["update_status"]()
+            # After switching models, refresh the loaded files list from the new session
+            self._send_command_to_ai("list files", append_to_chat=False, disable_controls=False)
         else:
             self.gui_callbacks["revert_model_selection"]()
 
-    def load_file(self, file_path: str):
-        if file_path:
-            if file_path not in self.loaded_files:
-                self.loaded_files.append(file_path)
-                self.loaded_files = list(sorted(set(self.loaded_files)))
-                # ASH MODIFICATION START: ADD TO AI'S SESSION_FILE_LIST DIRECTLY
-                if file_path not in self.ai.session_file_list:
-                    self.ai.session_file_list.append(file_path)
-                # ASH MODIFICATION END
-                self.gui_callbacks["update_loaded_files_display"]()
-                self.gui_callbacks["append_chat"]("system", f"Loaded file: {os.path.basename(file_path)}")
-                self.gui_callbacks["update_status"]()
-            else:
-                self.gui_callbacks["show_info_message"](f"{os.path.basename(file_path)} is already loaded.")
-
-    def unload_files(self, selected_basenames: List[str]):
-        if not selected_basenames:
+    def _send_command_to_ai(self, command: str, append_to_chat: bool = True, disable_controls: bool = True):
+        """Helper to send a command directly to AI without UI input field.
+        This is for internal file management commands that should be processed by eda_ai_assist.
+        """
+        if not self.ai.provider:
+            self.gui_callbacks["show_error_message"]("AI session is not active for command.")
             return
 
-        paths_to_remove = []
-        for basename in selected_basenames:
-            # Find the full path corresponding to the basename
-            for full_path in list(self.loaded_files): # Iterate over a copy to allow modification
-                if os.path.basename(full_path) == basename:
-                    paths_to_remove.append(full_path)
-                    break
-        
-        for file_path in paths_to_remove:
-            self.loaded_files.remove(file_path)
-            if file_path in self.ai.session_file_list:
-                self.ai.session_file_list.remove(file_path)
+        if append_to_chat:
+            self.gui_callbacks["append_chat"]("user", command)
+        if disable_controls:
+            self.gui_callbacks["disable_controls"]()
 
-        self.gui_callbacks["update_loaded_files_display"]()
-        self.gui_callbacks["append_chat"]("system", f"Unloaded {len(paths_to_remove)} file(s).")
-        self.gui_callbacks["update_status"]()
+        thread = threading.Thread(target=self._ai_request_thread, args=(command,), daemon=True)
+        thread.start()
+
+    def load_file(self, file_path: str):
+        if file_path:
+            # Check if file is already in AI's session_file_list by full path
+            if file_path in self.ai.session_file_list:
+                self.gui_callbacks["show_info_message"](f"{os.path.basename(file_path)} is already loaded.")
+            else:
+                self._send_command_to_ai(f"input file \"{file_path}\"")
+                # After loading, explicitly ask AI to list files to refresh GUI
+                self._send_command_to_ai("list files", append_to_chat=False, disable_controls=False)
+
+
+    def unload_files(self, selected_full_paths: List[str]): # Changed parameter name
+        if not selected_full_paths:
+            return
+
+        # No need for basename re-mapping, selected_full_paths are directly from the listbox
+        for file_path in selected_full_paths:
+            self._send_command_to_ai(f"delete file \"{file_path}\"")
+        
+        # After deleting, explicitly ask AI to list files to refresh GUI
+        if selected_full_paths: # Only list files if something was actually deleted
+            self._send_command_to_ai("list files", append_to_chat=False, disable_controls=False)
+
 
     def send_message(self, prompt: str):
         if not prompt:
@@ -157,23 +188,23 @@ class AshChatCore:
             self.gui_callbacks["show_error_message"]("AI session is not active.")
             return
 
-        if self.loaded_files:
-#           file_list_str = ", ".join(os.path.basename(f) for f in self.loaded_files)
-#           enhanced_prompt = f"Here are loaded files: {file_list_str}.\n\n{prompt}"
-            enhanced_prompt = ""
+        # Re-introduce logic to prepend loaded files to the prompt for AI context
+        enhanced_prompt = ""
+        if self.loaded_files: # self.loaded_files now mirrors self.ai.session_file_list via process_queue
             for file_path in self.loaded_files:
-               enhanced_prompt += "file %s\n" % file_path
-            enhanced_prompt += prompt
-            
-        else:
-            enhanced_prompt = prompt
-        print( enhanced_prompt )
+               # Use 'file' keyword and quote paths to handle spaces correctly
+               enhanced_prompt += f"file \"{file_path}\"\n"
+        enhanced_prompt += prompt
+        
+        # Original print statement (for debugging, can be removed in production)
+        # print( enhanced_prompt ) 
 
-        self.gui_callbacks["append_chat"]("user", prompt)
+        self.gui_callbacks["append_chat"]("user", prompt) # Display original user prompt
         self.gui_callbacks["clear_input_text"]()
         self.gui_callbacks["disable_controls"]()
 
-        self.ai.session_file_list = []
+        # The ai.session_file_list is managed by the eda_ai_assist module based on "input file" directives
+        # and its own internal logic, so we do not reset it here.
         thread = threading.Thread(target=self._ai_request_thread, args=(enhanced_prompt,), daemon=True)
         thread.start()
 
@@ -182,7 +213,6 @@ class AshChatCore:
             response = self.ai.ask_ai(prompt)
             warnings = self.ai.get_warnings()
             self.response_queue.put(("response", response, warnings))
-#           self.ai.session_file_list = list(sorted(set(self.ai.session_file_list)))
         except Exception as e:
             self.response_queue.put(("error", str(e), None))
         finally:
@@ -193,25 +223,24 @@ class AshChatCore:
             while True:
                 msg_type, data, extra = self.response_queue.get_nowait()
                 if msg_type == "response":
-                    self.gui_callbacks["append_chat"]("assistant", data)
+                    # Check if the response is a system message (e.g., from local file command in eda_ai_assist)
+                    if data.startswith("[system]: "):
+                        self.gui_callbacks["append_chat"]("system", data[len("[system]: "):])
+                    else:
+                        self.gui_callbacks["append_chat"]("assistant", data)
+                    
                     if extra:
                         for warning in extra:
                             self.gui_callbacks["append_chat"]("system", f"WARNING: {warning}")
                     
-                    # ASH MODIFICATION START
-                    # SYNCHRONIZE CORE'S LOADED_FILES WITH AI'S SESSION_FILE_LIST
-                    # THIS CAPTURES FILES LOADED EXPLICITLY VIA GUI AND FILES DISCOVERED BY AI IN PROMPTS
-#                   self.loaded_files = list(self.ai.session_file_list) 
-#                   self.gui_callbacks["update_loaded_files_display"]()
-                    # Ensure uniqueness when updating self.loaded_files from AI's list
-                    # Using a set to remove duplicates, then converting back to a list.
-                    # Sorting ensures a consistent order, though not strictly necessary for correctness.
+                    # SYNCHRONIZE CORE'S LOADED_FILES (for GUI display and prompt construction)
+                    # WITH AI'S SESSION_FILE_LIST (the true state of files tracked by AI)
+                    # This captures files loaded explicitly via GUI and files discovered by AI in prompts
                     unique_ai_files = list(sorted(set(self.ai.session_file_list)))
                     if unique_ai_files != self.loaded_files: # Only update if there's a change
                         self.loaded_files = unique_ai_files
+                        # Now call the GUI update, which reads from self.loaded_files
                         self.gui_callbacks["update_loaded_files_display"]()
-
-                    # ASH MODIFICATION END
 
                     self.gui_callbacks["update_status"]()
                     if not self.ai.provider:
@@ -262,19 +291,22 @@ ASHCHAT - Quick Reference Guide
 
 BASIC OPERATION
 - Type your prompt in the input area at the bottom.
-- Press Ctrl+Enter or click Send to submit.
-- Press Ctrl+D to toggle between normal and expanded multi-line input modes.
+- Press Enter to submit your prompt (when in single-line mode).
+- Press Ctrl+Enter to submit your prompt (works in both single-line and multi-line modes).
+- Press Ctrl+D to toggle between normal (single-line) and expanded multi-line input modes.
+- In multi-line mode, Enter inserts a newline. Use Ctrl+Enter or the "Send" button to submit.
+- Shift+Enter always inserts a newline.
 - Use the chat history area to review responses.
 
 FILE OPERATIONS (File Menu)
-- Load File: Add files to Loaded Files panel. Auto-included in all prompts.
-- Unload File: Remove files from Loaded Files panel.
+- Load File: Add files to Loaded Files panel. Handled by AI "input file" command.
+- Unload File: Remove files from Loaded Files panel. Handled by AI "delete file" command.
 - Save Chat Transcript: Save entire conversation to text file.
 - Save Selected Text: Save only highlighted text.
 
 LOADED FILES PANEL
 - Shows all currently loaded files at top of window.
-- Automatically referenced in every prompt sent.
+- These files are managed by the Ash AI session.
 - Use File > Unload File to remove files from this panel.
 
 TEXT EDITING (Edit Menu)
@@ -295,17 +327,14 @@ AI MODEL SELECTION (AI Menu)
 - Window title updates to show new provider and model.
 - Currently selected model shows as checked radio button.
 
-SESSION MANAGEMENT
+SESSION MANAGEMENT (AI Menu)
 - Flush Session: Clear history, unload files, reset tokens, start fresh.
-- Exit: Close GUI and terminate AI session.
-
-STATUS BAR
-- Shows token usage, loaded file count, and last response time.
-- Window title displays provider and model.
 
 KEYBOARD SHORTCUTS
-Ctrl+Enter     Send message
+Enter          Send message (single-line mode only)
+Ctrl+Enter     Send message (both modes)
 Ctrl+D         Toggle multi-line input mode
+Shift+Enter    Insert newline (always)
 Ctrl+C         Copy selected text (standard)
 Ctrl+V         Paste (standard, use Edit menu)
 """
@@ -314,16 +343,22 @@ Ctrl+V         Paste (standard, use Edit menu)
         if self.gui_callbacks["ask_confirmation"]("Flush AI session, clear chat, and unload all files?", "Confirm"):
             self.gui_callbacks["disable_controls"]()
             try:
+                # First, ensure all cloud files are deleted via AI command
+                self._send_command_to_ai("delete *", append_to_chat=False, disable_controls=False)
+                
+                # Close and re-open AI session
                 self.ai.close_ai_session()
                 self.gui_callbacks["clear_chat_display"]()
-                self.loaded_files.clear()
-                self.ai.session_file_list.clear()
-                self.gui_callbacks["update_loaded_files_display"]()
+                self.loaded_files.clear() # Clear local cache
+                self.ai.session_file_list.clear() # Clear eda_ai_assist's list explicitly
+                self.gui_callbacks["update_loaded_files_display"]() # Force update to clear display
 
                 self.ai.open_ai_session()
                 if self.ai.provider:
                     self.gui_callbacks["append_chat"]("system", "AI session flushed. Starting new conversation.")
                     self.gui_callbacks["update_status"]()
+                    # Refresh the file list after flushing - will be empty
+                    self._send_command_to_ai("list files", append_to_chat=False, disable_controls=False)
                 else:
                     self.gui_callbacks["show_error_message"]("Failed to restart AI session.")
             finally:
@@ -337,6 +372,16 @@ Ctrl+V         Paste (standard, use Edit menu)
             up = self.ai.token_cnt_upload
             down = self.ai.token_cnt_download
             cost_text = self.ai.ash_report_session_cost(model, ash_dir, up, down)
+
+        # Append any warnings/cost from close_ai_session if it was called implicitly
+        all_warnings = self.ai.get_warnings()
+        if all_warnings:
+            for w in all_warnings:
+                if "Estimated total cost:" in w: # Look for cost info specifically
+                    if cost_text: cost_text += "\n" + w
+                    else: cost_text = w
+                else: # Other warnings can be logged or ignored in exit message
+                    pass # Current implementation prints warnings to console, not GUI exit msg
 
         msg = "Close AshChat and terminate AI session?"
         if cost_text:
@@ -376,7 +421,7 @@ if USE_WXPYTHON:
                 "update_title": self._update_title,
                 "append_chat": self._append_chat,
                 "update_status": self._update_status,
-                "update_loaded_files_display": self._update_loaded_files_display,
+                "update_loaded_files_display": self._update_loaded_files_display, # Pass function directly
                 "clear_input_text": lambda: self.input_text.Clear(),
                 "disable_controls": self._disable_controls,
                 "re_enable_controls": self._re_enable_controls,
@@ -398,6 +443,13 @@ if USE_WXPYTHON:
             self.Show(True)
             self.Bind(wx.EVT_CLOSE, self._on_exit)
             self._update_font_menu_selection()
+
+            # Fix for Issue 1: Delay initial file list refresh until GUI is fully set up
+            wx.CallAfter(self._initial_file_list_refresh)
+
+        def _initial_file_list_refresh(self):
+            # This will trigger an AI call which then updates core.loaded_files and the GUI
+            self.core._send_command_to_ai("list files", append_to_chat=False, disable_controls=False)
 
         def _update_title(self, provider: str, model: str):
             self.SetTitle(f"AshChat - {provider}:{model}")
@@ -451,7 +503,7 @@ if USE_WXPYTHON:
             self.Bind(wx.EVT_MENU, self._reset_font_size, id=wx.ID_RESET)
             menubar.Append(format_menu, "F&ormat")
 
-            # AI menu (model selection)
+            # AI menu (model selection and session management)
             ai_menu = wx.Menu()
             self.model_radio_group = {}
             if self.core.model_config:
@@ -475,6 +527,11 @@ if USE_WXPYTHON:
                     self.model_radio_group[self.core.current_model_nickname].Check(True)
             else:
                 ai_menu.Append(wx.ID_ANY, "(No models configured)", "No AI models found", wx.ITEM_NORMAL).Enable(False)
+            
+            ai_menu.AppendSeparator()
+            flush_session_menu_item = ai_menu.Append(wx.ID_ANY, "&Flush Session", "Clear history, unload files, reset tokens")
+            self.Bind(wx.EVT_MENU, self._flush_session_wx, flush_session_menu_item)
+
             menubar.Append(ai_menu, "&AI")
 
             # Help menu
@@ -498,7 +555,8 @@ if USE_WXPYTHON:
             main_sizer = wx.BoxSizer(wx.VERTICAL)
 
             files_panel = wx.Panel(self)
-            files_box = wx.StaticBox(files_panel, label="Loaded Files (auto-included in prompts)")
+            # Updated label to reflect management by AI session
+            files_box = wx.StaticBox(files_panel, label="Loaded Files (managed by Ash AI session)")
             files_box.SetFont(self.gui_font_bold)
             self.font_updatable_widgets.append(files_box)
 
@@ -506,7 +564,7 @@ if USE_WXPYTHON:
 
             self.loaded_files_listbox = wx.ListBox(
                 files_panel,
-                style=wx.LB_SINGLE
+                style=wx.LB_SINGLE # Use single selection for now, MultiChoiceDialog handles multiple
             )
             self.loaded_files_listbox.SetFont(self.mono_font)
             self.font_updatable_widgets.append(self.loaded_files_listbox)
@@ -536,14 +594,16 @@ if USE_WXPYTHON:
 
             input_panel = wx.Panel(self)
             input_sizer = wx.BoxSizer(wx.VERTICAL)
-            input_label = wx.StaticText(input_panel, label="Prompt (Ctrl+Enter to send, Ctrl+D for multi-line)")
+            # Updated label text
+            input_label = wx.StaticText(input_panel, label="Prompt (Enter to send, Ctrl+Enter to force send, Ctrl+D for multi-line)")
             input_label.SetFont(self.gui_font)
             self.font_updatable_widgets.append(input_label)
             input_sizer.Add(input_label, 0, wx.ALIGN_LEFT | wx.LEFT | wx.TOP, 5)
 
             self.input_text = wx.TextCtrl(
                 input_panel,
-                style=wx.TE_MULTILINE | wx.HSCROLL | wx.VSCROLL
+                # Changed to word wrap, removed horizontal scroll
+                style=wx.TE_MULTILINE | wx.TE_WORDWRAP | wx.VSCROLL 
             )
             self.input_text.SetMinSize((-1, 75))
             self.input_text.SetFont(self.mono_font)
@@ -552,19 +612,14 @@ if USE_WXPYTHON:
             self.input_text.Bind(wx.EVT_KEY_DOWN, self._on_input_char_wx)
 
             button_sizer = wx.BoxSizer(wx.HORIZONTAL)
-            self.flush_button = wx.Button(input_panel, label="Flush Session")
-            self.flush_button.SetBackgroundColour(wx.Colour("#FF9800"))
-            self.flush_button.SetForegroundColour(wx.WHITE)
-            self.flush_button.SetFont(self.gui_font_bold)
-            self.flush_button.Bind(wx.EVT_BUTTON, self._flush_session_wx)
-            self.font_updatable_widgets.append(self.flush_button)
-            button_sizer.Add(self.flush_button, 0, wx.RIGHT, 5)
-
+            
+            # Send button is dynamic and initially hidden
             self.send_button = wx.Button(input_panel, label="Send")
             self.send_button.SetBackgroundColour(wx.Colour("#4CAF50"))
             self.send_button.SetForegroundColour(wx.WHITE)
             self.send_button.SetFont(self.gui_font_bold)
             self.send_button.Bind(wx.EVT_BUTTON, self._send_message_wx)
+            self.send_button.Hide() # Initially hidden
             self.font_updatable_widgets.append(self.send_button)
             button_sizer.Add(self.send_button, 0, wx.LEFT, 5)
 
@@ -593,59 +648,70 @@ if USE_WXPYTHON:
                 self.chat_display.AppendText(f"\n[System]: {message}\n")
             self.chat_display.ShowPosition(self.chat_display.GetLastPosition())
 
-#HERE
+        # Modified to read from self.core.loaded_files (which is synchronized by process_queue)
         def _update_loaded_files_display(self):
             self.loaded_files_listbox.Clear()
-            self.core.loaded_files = list(sorted(set(self.core.loaded_files)))
-            basename_list = []
-            for file_path in self.core.loaded_files:
-                basename = os.path.basename(file_path)
-                if basename not in basename_list:
-                    print("Appending %s %s" % ( file_path, basename ) )
-                    self.loaded_files_listbox.Append(basename)
-                    basename_list += [ basename ]
-                else:
-                    self.core.loaded_files.remove(file_path)
-                    print("Removing %s" % file_path )
-            for file_path in self.core.loaded_files:
-                print( file_path )
+            # Directly add full paths to the listbox for unambiguous display
+            for file_path in sorted(self.core.loaded_files): # Sort for consistent display
+                self.loaded_files_listbox.Append(file_path)
          
 
         def _on_input_char_wx(self, event):
             keycode = event.GetKeyCode()
+            # Handle Ctrl+Enter (sends in both modes)
             if keycode == wx.WXK_RETURN and event.CmdDown():
                 self._send_message_wx()
                 return
+            # Handle plain Enter
+            if keycode == wx.WXK_RETURN:
+                if event.ShiftDown():
+                    # Shift+Enter always inserts a newline
+                    event.Skip()
+                    return
+                else: # Plain Enter
+                    if not self.input_multiline_expanded:
+                        self._send_message_wx()
+                        return # Consume the event
+                    else:
+                        # In multi-line mode, plain Enter inserts a newline
+                        event.Skip()
+                        return
+            # Handle Ctrl+D for toggle multi-line
             if keycode == ord('D') and event.CmdDown():
                 self._toggle_multiline_wx()
                 return
-            event.Skip()
+            event.Skip() # For other keys
 
         def _send_message_wx(self, event=None):
             prompt = self.input_text.GetValue().strip()
             self.core.send_message(prompt)
 
         def _disable_controls(self):
-            self.send_button.Disable()
-            self.flush_button.Disable()
-            self.input_text.Disable()
+            # Check if widgets exist before attempting to disable
+            if hasattr(self, 'send_button') and self.send_button.IsShown(): 
+                self.send_button.Disable()
+            if hasattr(self, 'input_text'): self.input_text.Disable()
 
         def _re_enable_controls(self):
-            wx.CallAfter(self.send_button.Enable)
-            wx.CallAfter(self.flush_button.Enable)
-            wx.CallAfter(self.input_text.Enable)
-            wx.CallAfter(self.input_text.SetFocus)
+            # Check if widgets exist before attempting to enable
+            if hasattr(self, 'send_button') and self.send_button.IsShown(): 
+                wx.CallAfter(self.send_button.Enable)
+            if hasattr(self, 'input_text'):
+                wx.CallAfter(self.input_text.Enable)
+                wx.CallAfter(self.input_text.SetFocus)
 
         def _process_queue_wx(self, event=None):
             self.core.process_queue()
 
         def _toggle_multiline_wx(self):
             if not self.input_multiline_expanded:
-                self.input_text.SetMinSize((-1, 200))
+                self.input_text.SetMinSize((-1, 250)) # Made taller
                 self.input_multiline_expanded = True
+                self.send_button.Show() # Show Send button in multi-line mode
             else:
                 self.input_text.SetMinSize((-1, 75))
                 self.input_multiline_expanded = False
+                self.send_button.Hide() # Hide Send button in single-line mode
             self.Layout()
 
         def _set_font_size(self, size: int):
@@ -695,19 +761,23 @@ if USE_WXPYTHON:
                 self.core.load_file(file_path)
 
         def _unload_file_wx(self, event=None):
-            if not self.core.loaded_files:
+            if not self.core.loaded_files: # Use core's local list which is synchronized
                 wx.MessageBox("No files to unload.", "Info", wx.OK | wx.ICON_INFORMATION)
                 return
 
+            # Display full paths for unambiguous selection
+            current_display_paths = list(self.core.loaded_files)
+
             with wx.MultiChoiceDialog(
                 self, "Select file(s) to unload:", "Unload File",
-                [os.path.basename(f) for f in self.core.loaded_files]
+                current_display_paths # Display full paths
             ) as dialog:
                 if dialog.ShowModal() == wx.ID_OK:
                     selections = dialog.GetSelections()
                     if selections:
-                        selected_basenames = [os.path.basename(self.core.loaded_files[i]) for i in selections]
-                        self.core.unload_files(selected_basenames)
+                        # Map selected indices back to full paths
+                        selected_full_paths_for_core = [current_display_paths[i] for i in selections]
+                        self.core.unload_files(selected_full_paths_for_core)
 
         def _save_transcript_wx(self, event=None):
             with wx.FileDialog(
@@ -887,6 +957,15 @@ else: # USE_WXPYTHON is False
             self.root.after(100, self._process_queue_tk)
             self.root.protocol("WM_DELETE_WINDOW", self._on_exit)
 
+            # Fix for Issue 1: Delay initial file list refresh until GUI is fully set up
+            self.root.after(100, self._initial_file_list_refresh)
+
+
+        def _initial_file_list_refresh(self):
+            # This will trigger an AI call which then updates core.loaded_files and the GUI
+            self.core._send_command_to_ai("list files", append_to_chat=False, disable_controls=False)
+
+
         def _update_title(self, provider: str, model: str):
             self.root.title(f"AshChat - {provider}:{model}")
 
@@ -926,7 +1005,7 @@ else: # USE_WXPYTHON is False
             format_menu.add_separator()
             format_menu.add_command(label="Reset to Default", command=self._reset_font_size)
 
-            # AI menu (model selection)
+            # AI menu (model selection and session management)
             ai_menu = tk.Menu(menubar, tearoff=0)
             menubar.add_cascade(label="AI", menu=ai_menu)
 
@@ -954,6 +1033,9 @@ else: # USE_WXPYTHON is False
             else:
                 ai_menu.add_command(label="(No models configured)", state=tk.DISABLED)
 
+            ai_menu.add_separator()
+            ai_menu.add_command(label="Flush Session", command=self._flush_session_tk)
+
             # Help menu
             help_menu = tk.Menu(menubar, tearoff=0)
             menubar.add_cascade(label="Help", menu=help_menu)
@@ -973,7 +1055,8 @@ else: # USE_WXPYTHON is False
         def _setup_loaded_files_panel(self):
             files_frame = tk.LabelFrame(
                 self.root,
-                text="Loaded Files (auto-included in prompts)",
+                # Updated label to reflect management by AI session
+                text="Loaded Files (managed by Ash AI session)",
                 font=("Courier", self.current_gui_font_size, "bold")
             )
             files_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
@@ -986,7 +1069,8 @@ else: # USE_WXPYTHON is False
                 files_frame,
                 height=3,
                 font=("Courier", self.current_font_size),
-                yscrollcommand=files_scroll.set
+                yscrollcommand=files_scroll.set,
+                selectmode=tk.SINGLE
             )
             self.loaded_files_listbox.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
             files_scroll.config(command=self.loaded_files_listbox.yview)
@@ -1026,7 +1110,8 @@ else: # USE_WXPYTHON is False
 
             input_label = tk.Label(
                 self.input_frame,
-                text="Prompt (Ctrl+Enter to send, Ctrl+D for multi-line)",
+                # Updated label text
+                text="Prompt (Enter to send, Ctrl+Enter to force send, Ctrl+D for multi-line)",
                 font=("Courier", self.current_gui_font_size)
             )
             input_label.pack(anchor=tk.W)
@@ -1037,28 +1122,31 @@ else: # USE_WXPYTHON is False
 
             v_scroll = tk.Scrollbar(self.input_text_frame)
             v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-            h_scroll = tk.Scrollbar(self.input_text_frame, orient=tk.HORIZONTAL)
-            h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+            # Removed h_scroll for word wrap
+            # h_scroll = tk.Scrollbar(self.input_text_frame, orient=tk.HORIZONTAL)
+            # h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
 
             self.input_text = tk.Text(
                 self.input_text_frame,
                 height=5,
                 width=100,
                 font=("Courier", self.current_font_size),
-                wrap=tk.NONE,
-                yscrollcommand=v_scroll.set,
-                xscrollcommand=h_scroll.set
+                wrap=tk.WORD, # Changed to word wrap
+                yscrollcommand=v_scroll.set # Removed xscrollcommand
             )
             self.input_text.pack(fill=tk.BOTH, expand=True)
             v_scroll.config(command=self.input_text.yview)
-            h_scroll.config(command=self.input_text.xview)
+            # h_scroll.config(command=self.input_text.xview) # Removed h_scroll config
 
-            self.input_text.bind("<Control-Return>", lambda e: self._send_message_tk())
+            self.input_text.bind("<Return>", self._on_return_key_tk) # Bind plain Enter
+            self.input_text.bind("<Control-Return>", lambda e: self._send_message_tk()) # Ctrl+Enter always sends
+            self.input_text.bind("<Shift-Return>", lambda e: "break") # Shift+Enter always inserts newline
             self.input_text.bind("<Control-d>", lambda e: self._toggle_multiline_tk())
 
             button_frame = tk.Frame(self.input_frame)
             button_frame.pack(fill=tk.X, pady=5)
 
+            # Send button is dynamic and initially packed_forget
             self.send_button = tk.Button(
                 button_frame,
                 text="Send",
@@ -1069,21 +1157,8 @@ else: # USE_WXPYTHON is False
                 padx=20,
                 pady=5
             )
-            self.send_button.pack(side=tk.RIGHT, padx=5)
+            # Initially not packed; will be packed in _toggle_multiline_tk
             self.ui_components["buttons"].append(("send_button", self.send_button))
-
-            self.flush_button = tk.Button(
-                button_frame,
-                text="Flush Session",
-                command=self._flush_session_tk,
-                bg="#FF9800",
-                fg="white",
-                font=("Courier", self.current_gui_font_size, "bold"),
-                padx=20,
-                pady=5
-            )
-            self.flush_button.pack(side=tk.RIGHT, padx=5)
-            self.ui_components["buttons"].append(("flush_button", self.flush_button))
 
         def _setup_status_bar(self):
             self.status_bar = tk.Label(
@@ -1112,26 +1187,41 @@ else: # USE_WXPYTHON is False
             self.chat_display.see(tk.END)
             self.chat_display.config(state=tk.DISABLED)
 
+        # Modified to read from self.core.loaded_files (which is synchronized by process_queue)
         def _update_loaded_files_display(self):
             self.loaded_files_listbox.delete(0, tk.END)
-            for file_path in self.core.loaded_files:
-                basename = os.path.basename(file_path)
-                self.loaded_files_listbox.insert(tk.END, basename)
+            # Directly add full paths to the listbox for unambiguous display
+            for file_path in sorted(self.core.loaded_files): # Sort for consistent display
+                self.loaded_files_listbox.insert(tk.END, file_path)
+
+
+        def _on_return_key_tk(self, event):
+            # This handler is only for plain Enter (not Shift+Enter or Ctrl+Enter)
+            if not self.input_multiline_expanded:
+                self._send_message_tk()
+                return "break" # Consume event, prevent default newline
+            else:
+                # In multi-line mode, plain Enter inserts a newline
+                return # Allow default behavior (insert newline)
+
 
         def _send_message_tk(self):
             prompt = self.input_text.get("1.0", tk.END).strip()
             self.core.send_message(prompt)
 
         def _disable_controls(self):
-            self.send_button.config(state=tk.DISABLED)
-            self.flush_button.config(state=tk.DISABLED)
-            self.input_text.config(state=tk.DISABLED)
+            # Check if widgets exist before attempting to disable
+            if hasattr(self, 'send_button') and self.send_button.winfo_ismapped(): 
+                self.send_button.config(state=tk.DISABLED)
+            if hasattr(self, 'input_text'): self.input_text.config(state=tk.DISABLED)
 
         def _re_enable_controls(self):
-            self.send_button.config(state=tk.NORMAL)
-            self.flush_button.config(state=tk.NORMAL)
-            self.input_text.config(state=tk.NORMAL)
-            self.input_text.focus()
+            # Check if widgets exist before attempting to enable
+            if hasattr(self, 'send_button') and self.send_button.winfo_ismapped(): 
+                self.send_button.config(state=tk.NORMAL)
+            if hasattr(self, 'input_text'):
+                self.input_text.config(state=tk.NORMAL)
+                self.input_text.focus()
 
         def _process_queue_tk(self):
             self.core.process_queue()
@@ -1140,11 +1230,13 @@ else: # USE_WXPYTHON is False
         def _toggle_multiline_tk(self):
             self.input_frame.update_idletasks()
             if not self.input_multiline_expanded:
-                self.input_text.config(height=15)
+                self.input_text.config(height=20) # Made taller
                 self.input_multiline_expanded = True
+                self.send_button.pack(side=tk.RIGHT, padx=5) # Show Send button
             else:
                 self.input_text.config(height=5)
                 self.input_multiline_expanded = False
+                self.send_button.pack_forget() # Hide Send button
 
         def _set_font_size(self, size: int):
             if 8 <= size <= 18:
@@ -1158,10 +1250,11 @@ else: # USE_WXPYTHON is False
                 for component_type, components in self.ui_components.items():
                     if component_type == "labels":
                         for label_name, label_widget in components:
-                            if label_name == "files_frame_label":
+                            # Apply bold only to specific labels that should be bold
+                            if label_name in ["files_frame_label", "chat_label"]:
                                 label_widget.config(font=("Courier", size, "bold"))
                             else:
-                                label_widget.config(font=("Courier", size, "bold"))
+                                label_widget.config(font=("Courier", size))
                     elif component_type == "buttons":
                         for button_name, button_widget in components:
                             button_widget.config(font=("Courier", size, "bold"))
@@ -1179,13 +1272,19 @@ else: # USE_WXPYTHON is False
             self.core.load_file(file_path)
 
         def _unload_file_tk(self):
-            if not self.core.loaded_files:
+            if not self.core.loaded_files: # Use core's local list which is synchronized
                 messagebox.showinfo("Info", "No files to unload.")
                 return
 
+            # Display full paths for unambiguous selection
+            current_display_paths = list(self.core.loaded_files)
+
             unload_window = tk.Toplevel(self.root)
             unload_window.title("Unload File")
-            unload_window.geometry("400x200")
+            # Dynamically adjust height based on number of files
+            num_files = len(current_display_paths)
+            window_height = max(200, 100 + num_files * 25) # Base + 25px per file
+            unload_window.geometry(f"400x{window_height}")
 
             title_label = tk.Label(
                 unload_window,
@@ -1194,26 +1293,22 @@ else: # USE_WXPYTHON is False
             )
             title_label.pack(pady=10)
 
-            files_to_remove_basenames = []
+            # Use a listbox for selection
+            selection_listbox = tk.Listbox(
+                unload_window,
+                selectmode=tk.MULTIPLE,
+                height=min(10, num_files), # Max 10 visible, or num_files if less
+                font=("Courier", self.current_gui_font_size)
+            )
+            selection_listbox.pack(padx=20, pady=5, fill=tk.BOTH, expand=True)
 
-            def toggle_file(basename):
-                if basename in files_to_remove_basenames:
-                    files_to_remove_basenames.remove(basename)
-                else:
-                    files_to_remove_basenames.append(basename)
-
-            for file_path in self.core.loaded_files:
-                basename = os.path.basename(file_path)
-                chk = tk.Checkbutton(
-                    unload_window,
-                    text=basename,
-                    command=lambda fp=basename: toggle_file(fp),
-                    font=("Courier", self.current_gui_font_size)
-                )
-                chk.pack(anchor=tk.W, padx=20)
+            for full_path in current_display_paths:
+                selection_listbox.insert(tk.END, full_path) # Insert full paths
 
             def confirm_unload():
-                self.core.unload_files(files_to_remove_basenames)
+                selected_indices = selection_listbox.curselection()
+                selected_full_paths_for_core = [current_display_paths[i] for i in selected_indices]
+                self.core.unload_files(selected_full_paths_for_core)
                 unload_window.destroy()
 
             confirm_button = tk.Button(
@@ -1225,6 +1320,7 @@ else: # USE_WXPYTHON is False
                 pady=5
             )
             confirm_button.pack(pady=10)
+
 
         def _save_transcript_tk(self):
             file_path = filedialog.asksaveasfilename(
