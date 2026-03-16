@@ -177,9 +177,13 @@ class AshChatCore:
             self.loaded_files.append(abs_path)
             self.gui_callbacks["update_loaded_files_display"]()
             self.gui_callbacks["update_status"]()
-            self.gui_callbacks["show_info_message"](
-                f"Loaded: {os.path.basename(abs_path)}"
-            )
+# Loaded: filename popup was annoying
+#           self.gui_callbacks["show_info_message"](
+#               f"Loaded: {os.path.basename(abs_path)}"
+#           )
+#           print("ashchat_core.py : load_file() : self.loaded_files:")
+#           for each in self.loaded_files:
+#               print(f"    {each}")
         except Exception as e:
             self.gui_callbacks["show_error_message"](f"Error loading file: {e}")
 
@@ -231,13 +235,21 @@ class AshChatCore:
 
         rewritten_prompt = self._rewrite_prompt_with_output_dir(prompt)
 
+# HERE
+# Watch out for duplications in the session_file_list
         enhanced_prompt = ""
         if self.loaded_files:
+            session_list = [ os.path.basename( each ) for each in self.ai.session_file_list ];# list comprehension
             for file_path in self.loaded_files:
-                enhanced_prompt += f"file \"{file_path}\"\n"
+                if os.path.basename( file_path ) not in session_list:
+#               if os.path.basename( file_path ) not in self.ai.session_file_list:
+#                   enhanced_prompt += f"input file \"{file_path}\"\n"
+                    enhanced_prompt += f"file \"{file_path}\" .\n"
+                    print(f"ashchat_core.py : send_message : enhanced_prompt = {enhanced_prompt}")
         enhanced_prompt += rewritten_prompt
-
+ 
         self.message_queue.put(("send_message", enhanced_prompt))
+#       self.message_queue.put(("send_message", rewritten_prompt ))
 
     def _send_command_to_ai(self, command: str, append_to_chat: bool = True, disable_controls: bool = True):
         """Queue an internal command for processing."""
@@ -274,12 +286,11 @@ class AshChatCore:
             self.gui_callbacks["update_status"]()
             return
 
-
-
         # Run AI call in background thread
         thread = threading.Thread(target=self._ai_response_worker, args=(prompt,))
         thread.daemon = True
         thread.start()
+
 
     def _ai_response_worker(self, prompt: str):
         """Background thread worker for AI response."""
@@ -292,6 +303,15 @@ class AshChatCore:
 
             if not self.ai.provider:
                 self.gui_callbacks["append_chat"]("system", "AI session was closed due to token limits.")
+
+#HERE
+            self.loaded_files.clear()
+            for each in self.ai.session_file_list:
+                self.loaded_files.append( each )
+            self.gui_callbacks["update_loaded_files_display"]()
+#           response = self.ai.ask_ai("list files")
+#           print("list files response:")
+#           print( response )
 
         except Exception as e:
             self.gui_callbacks["append_chat"]("system", f"Error: {e}")
@@ -434,7 +454,7 @@ Multi-line Mode:
     def get_about_text(self) -> str:
         """Return about text for the application."""
         return """
-AshChat v1.01
+AshChat v1.02
 EDA AI Assistant GUI Frontend
 
 Part of eda_ai_assist project
@@ -492,6 +512,11 @@ if wx is not None:
             self.font_updatable_widgets = []
             self.input_multiline_expanded = False
     
+            self.line_height = 14
+            self.files_min_lines = 5
+            self.chat_default_lines = 8
+            self.prompt_min_lines = 4
+    
             gui_callbacks = {
                 "show_error_message": lambda msg: wx.MessageBox(msg, "Error", wx.OK | wx.ICON_ERROR),
                 "show_warning_message": lambda msg, title: wx.MessageBox(msg, title, wx.OK | wx.ICON_WARNING),
@@ -523,9 +548,10 @@ if wx is not None:
             self.Bind(wx.EVT_CLOSE, self._on_exit)
             self._update_font_menu_selection()
     
-            # Check the current model after everything is initialized
             wx.CallAfter(self._check_current_model)
             wx.CallAfter(self._initial_file_list_refresh)
+            wx.CallAfter(self._apply_initial_sash_positions)
+            wx.CallAfter(self.input_text.SetFocus) 
     
         def _check_current_model(self):
             """Ensure the current model is checked in the menu."""
@@ -536,6 +562,24 @@ if wx is not None:
     
         def _initial_file_list_refresh(self):
             self.core._send_command_to_ai("list files", append_to_chat=False, disable_controls=False)
+    
+        def _apply_initial_sash_positions(self):
+            """Set initial sash positions based on line heights."""
+            status_bar_height = self.status_bar.GetSize()[1]
+            available_height = self.GetClientSize()[1] - status_bar_height
+            
+            files_height = self.files_min_lines * self.line_height
+            chat_height = self.chat_default_lines * self.line_height
+            prompt_height = self.prompt_min_lines * self.line_height
+            
+            self.files_chat_height = files_height + chat_height
+            self.chat_prompt_ratio = chat_height / (chat_height + prompt_height) if (chat_height + prompt_height) > 0 else 0.667
+            
+            sash1_pos = self.files_chat_height
+            sash2_pos = int(available_height * self.chat_prompt_ratio)
+            
+            self.splitter.SetSashPosition(sash2_pos)
+            self.splitter1.SetSashPosition(files_height)
     
         def _update_title(self, provider: str, model: str):
             self.SetTitle(f"AshChat - {provider}:{model}")
@@ -651,16 +695,14 @@ if wx is not None:
         def _setup_panels(self):
             main_sizer = wx.BoxSizer(wx.VERTICAL)
     
-            splitter = wx.SplitterWindow(self)
-            splitter.SetMinimumPaneSize(40)
-            main_sizer.Add(splitter, 1, wx.EXPAND)
+            self.splitter = wx.SplitterWindow(self)
+            self.splitter.SetMinimumPaneSize(self.files_min_lines * self.line_height)
+            main_sizer.Add(self.splitter, 1, wx.EXPAND)
     
-            # First splitter: Files and Chat
-            splitter1 = wx.SplitterWindow(splitter)
-            splitter1.SetMinimumPaneSize(40)
+            self.splitter1 = wx.SplitterWindow(self.splitter)
+            self.splitter1.SetMinimumPaneSize(self.files_min_lines * self.line_height)
     
-            # Files panel
-            files_panel = wx.Panel(splitter1)
+            files_panel = wx.Panel(self.splitter1)
             files_box = wx.StaticBox(files_panel, label="Loaded Files (managed by Ash AI session)")
             files_box.SetFont(self.mono_font)
             self.font_updatable_widgets.append(files_box)
@@ -672,12 +714,12 @@ if wx is not None:
                 style=wx.LB_SINGLE
             )
             self.loaded_files_listbox.SetFont(self.mono_font)
+    #       self.loaded_files_listbox.SetSelection(wx.NOT_FOUND)
             self.font_updatable_widgets.append(self.loaded_files_listbox)
             files_sizer.Add(self.loaded_files_listbox, 1, wx.EXPAND | wx.ALL, 5)
             files_panel.SetSizer(files_sizer)
     
-            # Chat panel
-            chat_panel = wx.Panel(splitter1)
+            chat_panel = wx.Panel(self.splitter1)
             chat_sizer = wx.BoxSizer(wx.VERTICAL)
             chat_label = wx.StaticText(chat_panel, label="Chat History")
             chat_label.SetFont(self.mono_font)
@@ -689,19 +731,16 @@ if wx is not None:
                 style=wx.TE_MULTILINE | wx.TE_READONLY | wx.VSCROLL | wx.TE_WORDWRAP
             )
             self.chat_display.SetFont(self.mono_font)
-            self.chat_display.SetBackgroundColour(wx.Colour("#f0f0f0"))
             self.font_updatable_widgets.append(self.chat_display)
             chat_sizer.Add(self.chat_display, 1, wx.EXPAND | wx.ALL, 5)
             chat_panel.SetSizer(chat_sizer)
     
             self.chat_display.Bind(wx.EVT_CONTEXT_MENU, self._on_chat_display_context_menu)
     
-            # Split files and chat horizontally with gravity 1/6 for files, 1/6 for chat
-            splitter1.SplitHorizontally(files_panel, chat_panel)
-            splitter1.SetSashGravity(0.5)
+            self.splitter1.SplitHorizontally(files_panel, chat_panel)
+            self.splitter1.SetSashGravity(0.5)
     
-            # Input panel
-            input_panel = wx.Panel(splitter)
+            input_panel = wx.Panel(self.splitter)
             input_sizer = wx.BoxSizer(wx.VERTICAL)
             self.input_label = wx.StaticText(input_panel, label="Prompt (Enter to send, Ctrl+D for multi-line mode)")
             self.input_label.SetFont(self.mono_font)
@@ -712,7 +751,7 @@ if wx is not None:
                 input_panel,
                 style=wx.TE_MULTILINE | wx.TE_WORDWRAP | wx.VSCROLL
             )
-            self.input_text.SetMinSize((-1, 40))
+            self.input_text.SetMinSize((-1, self.prompt_min_lines * self.line_height))
             self.input_text.SetFont(self.mono_font)
             self.font_updatable_widgets.append(self.input_text)
             input_sizer.Add(self.input_text, 1, wx.EXPAND | wx.ALL, 5)
@@ -720,9 +759,8 @@ if wx is not None:
     
             input_panel.SetSizer(input_sizer)
     
-            # Split files/chat and input vertically with gravity 2/3 for input, 1/3 for files/chat
-            splitter.SplitHorizontally(splitter1, input_panel)
-            splitter.SetSashGravity(0.3333)
+            self.splitter.SplitHorizontally(self.splitter1, input_panel)
+            self.splitter.SetSashGravity(0.667)
     
             self.status_bar = self.CreateStatusBar()
             sb_font = self.status_bar.GetFont()
@@ -732,7 +770,6 @@ if wx is not None:
     
             self.SetSizer(main_sizer)
             self.Layout()
-    
         def _update_status(self):
             self.status_bar.SetStatusText(self.core.get_status_text())
     
@@ -750,7 +787,7 @@ if wx is not None:
             for file_path in sorted(self.core.loaded_files):
                 file_name = os.path.basename(file_path)
                 self.loaded_files_listbox.Append(file_name)
-    #           self.loaded_files_listbox.Append(file_path)
+    #       self.loaded_files_listbox.SetSelection(wx.NOT_FOUND)
     
         def _update_input_label(self):
             """Update the input label based on multi-line mode."""
@@ -802,7 +839,7 @@ if wx is not None:
                 self.input_text.SetMinSize((-1, 200))
                 self.input_multiline_expanded = True
             else:
-                self.input_text.SetMinSize((-1, 40))
+                self.input_text.SetMinSize((-1, self.prompt_min_lines * self.line_height))
                 self.input_multiline_expanded = False
             self._update_input_label()
             self.Layout()
@@ -819,15 +856,12 @@ if wx is not None:
     
                 for widget in self.font_updatable_widgets:
                     if isinstance(widget, wx.StaticBox):
-    #                   widget.SetFont(self.gui_font_bold)
                         widget.SetFont(self.mono_font)
                     elif isinstance(widget, wx.StaticText) or isinstance(widget, wx.Button):
                         original_font = widget.GetFont()
                         if original_font.GetWeight() == wx.FONTWEIGHT_BOLD:
-    #                       widget.SetFont(self.gui_font_bold)
                             widget.SetFont(self.mono_font)
                         else:
-    #                       widget.SetFont(self.gui_font)
                             widget.SetFont(self.mono_font)
                     elif isinstance(widget, wx.TextCtrl) or isinstance(widget, wx.ListBox):
                         widget.SetFont(self.mono_font)
@@ -1008,8 +1042,8 @@ if wx is not None:
         app.MainLoop()
     
     
-    if __name__ == "__main__":
-        main_gui()
+    #if __name__ == "__main__":
+    #    main_gui()
     
 
 # ============= ashchat_tk.py =============
@@ -1028,13 +1062,20 @@ class TkFrontend(tk.Tk):
         self.geometry("900x700")
         self.minsize(600, 400)
 
-        self.default_font_size = 10
-        self.default_gui_font_size = 10
+        self.default_font_size = 12
+        self.default_gui_font_size = 12
         self.current_font_size = self.default_font_size
         self.current_gui_font_size = self.default_gui_font_size
 
         self.input_multiline_expanded = False
         self.font_updatable_widgets = []
+
+        self.line_height_estimate = 20
+        self.files_lines = 5
+        self.prompt_lines = 5
+        self.pane_ratios = None
+        self.last_total_height = None
+        self.min_pane_height = None
 
         gui_callbacks = {
             "show_error_message": lambda msg: messagebox.showerror("Error", msg),
@@ -1190,21 +1231,22 @@ class TkFrontend(tk.Tk):
         main_frame.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
 
         # Create main paned window for all three sections (files, chat, input)
-        main_paned = tk.PanedWindow(main_frame, orient=tk.VERTICAL, sashwidth=5)
-        main_paned.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
+        self.main_paned = tk.PanedWindow(main_frame, orient=tk.VERTICAL, sashwidth=5)
+        self.main_paned.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
+        self.main_paned.bind("<Configure>", self._on_paned_configure)
 
         # Files panel
-        files_frame = tk.LabelFrame(main_paned, text="Loaded Files (managed by Ash AI session)")
+        files_frame = tk.LabelFrame(self.main_paned, text="Loaded Files (managed by Ash AI session)")
         files_scrollbar = tk.Scrollbar(files_frame)
         files_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.loaded_files_listbox = tk.Listbox(files_frame, yscrollcommand=files_scrollbar.set)
         self.loaded_files_listbox.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         files_scrollbar.config(command=self.loaded_files_listbox.yview)
         self.font_updatable_widgets.append(self.loaded_files_listbox)
-        main_paned.add(files_frame)
+        self.files_pane = self.main_paned.add(files_frame)
 
         # Chat panel
-        chat_frame = tk.LabelFrame(main_paned, text="Chat History")
+        chat_frame = tk.LabelFrame(self.main_paned, text="Chat History")
         chat_scrollbar = tk.Scrollbar(chat_frame)
         chat_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.chat_display = tk.Text(chat_frame, state=tk.NORMAL, wrap=tk.WORD, yscrollcommand=chat_scrollbar.set)
@@ -1213,10 +1255,10 @@ class TkFrontend(tk.Tk):
         self.chat_display.bind("<Button-3>", self._on_chat_display_context_menu)
         chat_scrollbar.config(command=self.chat_display.yview)
         self.font_updatable_widgets.append(self.chat_display)
-        main_paned.add(chat_frame)
+        self.chat_pane = self.main_paned.add(chat_frame)
 
         # Input panel
-        input_frame = tk.LabelFrame(main_paned, text="Prompt (Enter to send, Ctrl+D for multi-line mode)")
+        input_frame = tk.LabelFrame(self.main_paned, text="Prompt (Enter to send, Ctrl+D for multi-line mode)")
         input_scrollbar = tk.Scrollbar(input_frame)
         input_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.input_text = tk.Text(input_frame, height=3, wrap=tk.WORD, yscrollcommand=input_scrollbar.set)
@@ -1226,56 +1268,81 @@ class TkFrontend(tk.Tk):
         self.input_text.bind("<Button-3>", self._on_chat_display_context_menu)
         input_scrollbar.config(command=self.input_text.yview)
         self.font_updatable_widgets.append(self.input_text)
-        main_paned.add(input_frame)
+        self.input_pane = self.main_paned.add(input_frame)
 
         self.input_frame = input_frame
+        self.input_text.focus()
 
         # Status bar
         self.status_bar = tk.Label(self, text="", bd=1, relief=tk.SUNKEN, anchor=tk.W)
         self.status_bar.pack(fill=tk.X, padx=0, pady=0)
         self.font_updatable_widgets.append(self.status_bar)
 
-    def not_setup_panels(self):
-        main_frame = tk.Frame(self)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
+    def _on_paned_configure(self, event):
+        """Handle paned window resize events to maintain pane ratios."""
+        if event.widget != self.main_paned:
+            return
 
-        # Create main paned window for all three sections (files, chat, input)
-        main_paned = tk.PanedWindow(main_frame, orient=tk.VERTICAL, sashwidth=5)
-        main_paned.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
+        current_heights = self.main_paned.panes()
+        if len(current_heights) < 3:
+            return
 
-        # Files panel
-        files_frame = tk.LabelFrame(main_paned, text="Loaded Files (managed by Ash AI session)")
-        self.loaded_files_listbox = tk.Listbox(files_frame, height=6)
-        self.loaded_files_listbox.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        self.font_updatable_widgets.append(self.loaded_files_listbox)
-        main_paned.add(files_frame)
+        total_height = self.main_paned.winfo_height()
 
-        # Chat panel
-        chat_frame = tk.LabelFrame(main_paned, text="Chat History")
-        self.chat_display = tk.Text(chat_frame, state=tk.NORMAL, wrap=tk.WORD)
-        self.chat_display.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        self.chat_display.config(state=tk.DISABLED)
-        self.chat_display.bind("<Button-3>", self._on_chat_display_context_menu)
-        self.font_updatable_widgets.append(self.chat_display)
-        main_paned.add(chat_frame)
+        if total_height <= 1:
+            return
 
+        if self.min_pane_height is None:
+            self.min_pane_height = int(self.line_height_estimate)
 
-        # Input panel
-        input_frame = tk.LabelFrame(main_paned, text="Prompt (Enter to send, Ctrl+D for multi-line mode)")
-        self.input_text = tk.Text(input_frame, height=3, wrap=tk.WORD)
-        self.input_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        self.input_text.bind("<Return>", self._on_input_char_tk)
-        self.input_text.bind("<Control-d>", lambda e: self._toggle_multiline_tk())
-        self.input_text.bind("<Button-3>", self._on_chat_display_context_menu)
-        self.font_updatable_widgets.append(self.input_text)
-        main_paned.add(input_frame)
+        files_height = self.files_lines * self.line_height_estimate
+        prompt_height = self.prompt_lines * self.line_height_estimate
 
-        self.input_frame = input_frame
+        if self.pane_ratios is None:
+            try:
+                pane_list = self.main_paned.panes()
+                remaining_height = max(total_height - files_height - prompt_height, self.line_height_estimate)
+                total_units = files_height + remaining_height + prompt_height
+                self.pane_ratios = [
+                    files_height / total_units,
+                    remaining_height / total_units,
+                    prompt_height / total_units
+                ]
+            except Exception:
+                self.pane_ratios = [0.25, 0.50, 0.25]
 
-        # Status bar
-        self.status_bar = tk.Label(self, text="", bd=1, relief=tk.SUNKEN, anchor=tk.W)
-        self.status_bar.pack(fill=tk.X, padx=0, pady=0)
-        self.font_updatable_widgets.append(self.status_bar)
+        if self.last_total_height != total_height:
+            self.last_total_height = total_height
+            
+            new_heights = [
+                self.files_lines * self.line_height_estimate,
+                max(total_height - (self.files_lines * self.line_height_estimate) - (self.prompt_lines * self.line_height_estimate), self.line_height_estimate),
+                self.prompt_lines * self.line_height_estimate
+            ]
+
+            try:
+                pane_list = self.main_paned.panes()
+                for i, pane in enumerate(pane_list):
+                    if i < len(new_heights):
+                        self.main_paned.paneconfigure(pane, height=new_heights[i])
+            except Exception:
+                pass
+
+    def _update_pane_ratios(self):
+        """Update stored pane ratios based on current sash positions."""
+        try:
+            pane_list = self.main_paned.panes()
+            if len(pane_list) >= 3:
+                heights = []
+                for pane in pane_list:
+                    h = self.main_paned.winfo_reqheight()
+                    heights.append(max(h, self.min_pane_height or 30))
+
+                total = sum(heights)
+                if total > 0:
+                    self.pane_ratios = [h / total for h in heights]
+        except Exception:
+            pass
 
     def _update_status(self):
         self.status_bar.config(text=self.core.get_status_text())
@@ -1296,7 +1363,6 @@ class TkFrontend(tk.Tk):
         for file_path in sorted(self.core.loaded_files):
             file_name = os.path.basename(file_path)
             self.loaded_files_listbox.insert(tk.END, file_name)
-#           self.loaded_files_listbox.insert(tk.END, file_path)
 
     def _on_input_char_tk(self, event):
         if event.state & 0x4:
@@ -1508,8 +1574,8 @@ def main_gui():
     app.mainloop()
 
 
-if __name__ == "__main__":
-    main_gui()
+#if __name__ == "__main__":
+#    main_gui()
 
 
 # ============= ashchat_main.py =============

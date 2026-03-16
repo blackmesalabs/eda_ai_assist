@@ -50,7 +50,7 @@ import subprocess
 import signal
 import shlex
 import glob
-import re
+import re as _re
 import time
 import getpass
 from typing import Optional, Literal, Tuple, List, Dict, Any
@@ -82,7 +82,7 @@ _win_completion_active = False
 # Metadata
 __title__ = "ash(eda_ai_assist)"
 __description__ = "Ash: a REPL and API for external EDA programs."
-__version__ = "1.0.3"
+__version__ = "1.0.4"
 __version_info__ = (1, 0, 3)
 __author__ = "Kevin M. Hubbard, Black Mesa Labs"
 __license__ = "GPL3"
@@ -591,6 +591,16 @@ class api_eda_ai_assist:
 
         return results
 
+    def _prune_missing_files(self):
+        """Remove files from session_file_list that no longer exist on disk."""
+        remaining = []
+        for file_path in self.session_file_list:
+            if os.path.exists(file_path):
+                remaining.append(file_path)
+            else:
+                self._warnings.append(f"File no longer exists, removing from session: {file_path}")
+        self.session_file_list = remaining
+
     def _get_local_host_token_impl(self, length: int) -> str:
         candidate = None
         for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
@@ -679,11 +689,15 @@ class api_eda_ai_assist:
         input_file_list, delete_file_list = self.ai_input_files(prompt, output_file)
 
         if self.debug:
-            print("ask_ai : input_file_list")
-            for each in input_file_list:
-                print(str(each))
+            if prompt:
+                print("ask_ai() : prompt:")
+                print(f"{prompt}")
+            if input_file_list:
+                print("eda_ai_assist : ask_ai() : input_file_list:")
+                for each in input_file_list:
+                    print(str(each))
             if delete_file_list:
-                print("ask_ai : delete_file_list")
+                print("ask_ai() : delete_file_list:")
                 for each in delete_file_list:
                     print(str(each))
 
@@ -731,8 +745,8 @@ class api_eda_ai_assist:
             return result
 
 
-
     def ask_ai_model(self, prompt, intro_prompt, input_file_list, delete_file_list):
+        self._prune_missing_files()
         if self.debug:
             print("ask_ai_model() %s" % prompt)
             for each_file in input_file_list:
@@ -816,49 +830,57 @@ class api_eda_ai_assist:
 
     # ---------- Output file parsing ----------
     def ai_output_file(self, prompt):
-        TRIGGERS = ("output to", "write to")
         SKIP = {"file", "the", "a"}
 
         def strip_trailing_punct(tok: str) -> str:
             return tok.rstrip(".,;:!?)]}'\"")
 
-        lower = prompt.lower()
+        # Use regex with word boundaries to match "output to" or "write to" as complete phrases
+        pattern = r"\b(?:output|write)\s+to\b"
+        matches = list(_re.finditer(pattern, prompt, _re.IGNORECASE))
+        
+        if not matches:
+            return None
+        
+        # Use the first match
+        match = matches[0]
+        after_original = prompt[match.end():].strip()
+        cleaned = (
+            after_original.replace(",", " ")
+            .replace(";", " ")
+            .replace(":", " ")
+        )
+        tokens = cleaned.split()
+        for token in tokens:
+            if token.lower() in SKIP:
+                continue
+            tmp = token.rstrip(",;:!?()[]{}")
+            quoted = len(tmp) >= 2 and tmp[0] == tmp[-1] and tmp[0] in {"'", '"'}
 
-        for trig in TRIGGERS:
-            idx = lower.find(trig)
-            if idx != -1:
-                after_original = prompt[idx + len(trig):].strip()
-                cleaned = (
-                    after_original.replace(",", " ")
-                    .replace(";", " ")
-                    .replace(":", " ")
-                )
-                tokens = cleaned.split()
-                for token in tokens:
-                    if token.lower() in SKIP:
-                        continue
-                    tmp = token.rstrip(",;:!?()[]{}")
-                    quoted = len(tmp) >= 2 and tmp[0] == tmp[-1] and tmp[0] in {"'", '"'}
+            candidate = strip_trailing_punct(token)
+            candidate = candidate.strip(",;:!?()[]{}'\"")
+            if not quoted and candidate.endswith("."):
+                candidate = candidate[:-1]
+            if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in {"'", '"'}:
+                candidate = candidate[1:-1]
 
-                    candidate = strip_trailing_punct(token)
-                    candidate = candidate.strip(",;:!?()[]{}'\"")
-                    if not quoted and candidate.endswith("."):
-                        candidate = candidate[:-1]
-                    if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in {"'", '"'}:
-                        candidate = candidate[1:-1]
-
-                    if candidate:
-                        candidate = os.path.expanduser(os.path.expandvars(candidate))
-                        return candidate
+            if candidate:
+                candidate = os.path.expanduser(os.path.expandvars(candidate))
+                return candidate
         return None
 
     # ---------- Input file parsing ----------
     def ai_input_files(self, prompt, out_file, must_exist=True):
+        if self.debug:
+            print(f"eda_ai_assist : ai_input_files( {prompt} )")
         import re as _re
         import os as _os
 
-        TRIG_RE = _re.compile(r"\b(?:file|files|analyze|load|input)\b", _re.IGNORECASE) # Added 'input'
-        DEL_TRIG_RE = _re.compile(r"\b(?:delete|remove|rm)\b(?:\s+(?:file|files))?", _re.IGNORECASE)
+#       TRIG_RE = _re.compile(r"\b(?:file|files|analyze|load|input)\b", _re.IGNORECASE) # Added 'input'
+        TRIG_RE = _re.compile(r"\b(?:file|files)\b", _re.IGNORECASE) # Added 'input'
+#       DEL_TRIG_RE = _re.compile(r"\b(?:delete|remove|rm)\b(?:\s+(?:file|files))?", _re.IGNORECASE)
+        DEL_TRIG_RE = _re.compile(r"(?<!\w)(?:delete|remove|rm)(?!\w)", _re.IGNORECASE)
+
 
         TOKEN_RE = _re.compile(
             r'''
@@ -936,8 +958,14 @@ class api_eda_ai_assist:
                     if candidate_expanded in seen:
                         continue
                     if not must_exist or _os.path.isfile(candidate_expanded):
-                        found.append(candidate_expanded)
-                        seen.add(candidate_expanded)
+                        if os.path.basename( candidate_expanded ) not in found:
+                            found.append(candidate_expanded)
+                            seen.add(candidate_expanded)
+                            if self.debug:
+                                print(f"  candidate_expanded = {candidate_expanded}")
+        if self.debug:
+            print(f"eda_ai_assist : ai_input_files( {prompt}")
+            print(f"  found = {found}")
 
         return found, delete_found
 
@@ -1526,9 +1554,13 @@ class aws_bedrock_provider(ai_provider):
         for each_file in input_file_list:
             if each_file not in self.parent.session_file_list:
                 self.parent.session_file_list.append(each_file)
+                if self.debug:
+                    print(f"eda_ai_assist : session_file_list.append( {each_file} ) from input_file_list")
             if not any(each_file == item[0] for item in self._session_files):
                 name = self.parent.make_ash_cloud_name(each_file)
                 self._session_files.append((each_file, name))
+                if self.debug:
+                    print(f"eda_ai_assist : session_files.append( {each_file},{name} ) from input_file_list")
 
         # Re-read all session files fresh on every call (mirrors azure_gateway_provider behavior)
         file_blocks = []
@@ -1687,17 +1719,22 @@ class azure_gateway_provider(ai_provider):
         self._session_files: List[tuple[str, str]] = []
         self.history: List[Dict[str, str]] = [] # Azure uses its own history tracking
         self.debug = parent.debug
+        if not self.api_key and "AZURE_OPENAI_API_KEY" in os.environ:
+            self.api_key = os.environ["AZURE_OPENAI_API_KEY"]
 
     def open_session(self):
         if self.debug:
             print("open_session(azure_gateway:%s)" % self.model)
+#           print("open_session(azure_gateway:%s %s)" % ( self.model, self.api_key ))
         from openai import AzureOpenAI
 
         self.client = AzureOpenAI(
             azure_endpoint=self.parent.cfg["ASH_ENDPOINT"],
-            api_key=self.parent.cfg["ASH_API_KEY"],
+            api_key=self.api_key,
+#           api_key=self.parent.cfg["ASH_API_KEY"],
             api_version=self.parent.cfg["ASH_API_VERSION"],
         )
+
         self.chat = self.client.chat
         self.history = [] # Reset history on new session
 
@@ -1739,8 +1776,12 @@ class azure_gateway_provider(ai_provider):
 
         # Register any new files into the session tracking list
         for each_file in input_file_list:
+            if self.debug:
+                print(f"input_file_list: {each_file}")
             if each_file not in self.parent.session_file_list:
                 self.parent.session_file_list.append(each_file)
+                if self.debug:
+                    print(f"session_file_list.append( {each_file} )")
             if not any(each_file == item[0] for item in self._session_files):
                 name = self.parent.make_ash_cloud_name(each_file)
                 self._session_files.append((each_file, name))
@@ -1778,6 +1819,7 @@ class azure_gateway_provider(ai_provider):
         try:
             response = self.chat.completions.create(model=self.model, messages=messages) # Use 'messages' list
             answer = response.choices[0].message.content
+
             if self.debug:
                 print(messages)
 
@@ -1895,6 +1937,8 @@ class gemini_provider(ai_provider):
         for each_file in input_file_list:
             if each_file not in self.parent.session_file_list:
                 self.parent.session_file_list.append(each_file)
+                if self.debug:
+                    print(f"eda_ai_assist : send_message : session_file_list.append( {each_file} ) from input_file_list )")
             if not any(each_file == item[0] for item in self._session_files):
                 if not os.path.exists(each_file):
                     # print(f"Warning: Attempted to upload non-existent file: {each_file}", file=sys.stderr) # Removed direct print
@@ -1909,9 +1953,11 @@ class gemini_provider(ai_provider):
                         file=each_file,
                         config={"mime_type": "text/plain", "display_name": name},
                     )
-                    if self.debug:
-                        print(f"Uploaded file '{each_file}' as: {uploaded_file.name}")
+#                   if self.debug:
+#                       print(f"Uploaded file '{each_file}' as: {uploaded_file.name}")
                     self._session_files.append((each_file, uploaded_file))
+                    if self.debug:
+                        print(f"eda_ai_assist : send_message : session_files.append( {each_file},{uploaded_file} ) )")
                 except Exception as e:
                     # print(f"Error uploading file '{each_file}' to Gemini: {e}", file=sys.stderr) # Removed direct print
                     self.parent._warnings.append(f"Error uploading file '{each_file}' to Gemini: {e}")
@@ -2316,7 +2362,7 @@ def _save_history():
 
 
 # ---------- Bang expansion ----------
-BANG_RE = re.compile(r"^!(.+)$")
+BANG_RE = _re.compile(r"^!(.+)$")
 
 
 def expand_bang(line: str) -> str:
