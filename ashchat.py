@@ -1574,8 +1574,8 @@ def main_gui():
     app.mainloop()
 
 
-#if __name__ == "__main__":
-#    main_gui()
+if __name__ == "__main__":
+    main_gui()
 
 
 # ============= ashchat_main.py =============
