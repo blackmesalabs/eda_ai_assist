@@ -551,7 +551,7 @@ if wx is not None:
             wx.CallAfter(self._check_current_model)
             wx.CallAfter(self._initial_file_list_refresh)
             wx.CallAfter(self._apply_initial_sash_positions)
-            wx.CallAfter(self.input_text.SetFocus) 
+            wx.CallAfter(self.input_text.SetFocus)
     
         def _check_current_model(self):
             """Ensure the current model is checked in the menu."""
@@ -565,21 +565,11 @@ if wx is not None:
     
         def _apply_initial_sash_positions(self):
             """Set initial sash positions based on line heights."""
-            status_bar_height = self.status_bar.GetSize()[1]
-            available_height = self.GetClientSize()[1] - status_bar_height
-            
             files_height = self.files_min_lines * self.line_height
             chat_height = self.chat_default_lines * self.line_height
-            prompt_height = self.prompt_min_lines * self.line_height
-            
-            self.files_chat_height = files_height + chat_height
-            self.chat_prompt_ratio = chat_height / (chat_height + prompt_height) if (chat_height + prompt_height) > 0 else 0.667
-            
-            sash1_pos = self.files_chat_height
-            sash2_pos = int(available_height * self.chat_prompt_ratio)
-            
-            self.splitter.SetSashPosition(sash2_pos)
+    
             self.splitter1.SetSashPosition(files_height)
+            self.splitter.SetSashPosition(files_height + chat_height)
     
         def _update_title(self, provider: str, model: str):
             self.SetTitle(f"AshChat - {provider}:{model}")
@@ -659,7 +649,7 @@ if wx is not None:
                         menu_item = provider_submenu.Append(wx.ID_ANY, nickname, f"Switch to {nickname} model", wx.ITEM_CHECK)
                         self.model_radio_group[nickname] = menu_item
                         self.all_model_items.append(menu_item)
-                        
+    
                         handler_id = menu_item.GetId()
                         self.Bind(wx.EVT_MENU, lambda evt, n=nickname: self._on_model_select(n), id=handler_id)
     
@@ -714,7 +704,6 @@ if wx is not None:
                 style=wx.LB_SINGLE
             )
             self.loaded_files_listbox.SetFont(self.mono_font)
-    #       self.loaded_files_listbox.SetSelection(wx.NOT_FOUND)
             self.font_updatable_widgets.append(self.loaded_files_listbox)
             files_sizer.Add(self.loaded_files_listbox, 1, wx.EXPAND | wx.ALL, 5)
             files_panel.SetSizer(files_sizer)
@@ -770,6 +759,7 @@ if wx is not None:
     
             self.SetSizer(main_sizer)
             self.Layout()
+    
         def _update_status(self):
             self.status_bar.SetStatusText(self.core.get_status_text())
     
@@ -787,7 +777,6 @@ if wx is not None:
             for file_path in sorted(self.core.loaded_files):
                 file_name = os.path.basename(file_path)
                 self.loaded_files_listbox.Append(file_name)
-    #       self.loaded_files_listbox.SetSelection(wx.NOT_FOUND)
     
         def _update_input_label(self):
             """Update the input label based on multi-line mode."""
@@ -1042,8 +1031,8 @@ if wx is not None:
         app.MainLoop()
     
     
-    #if __name__ == "__main__":
-    #    main_gui()
+    if __name__ == "__main__":
+        main_gui()
     
 
 # ============= ashchat_tk.py =============
@@ -1229,10 +1218,13 @@ class TkFrontend(tk.Tk):
     def _setup_panels(self):
         main_frame = tk.Frame(self)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
+        main_frame.grid_rowconfigure(0, weight=1)
+        main_frame.grid_rowconfigure(1, weight=0)
+        main_frame.grid_columnconfigure(0, weight=1)
 
         # Create main paned window for all three sections (files, chat, input)
         self.main_paned = tk.PanedWindow(main_frame, orient=tk.VERTICAL, sashwidth=5)
-        self.main_paned.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
+        self.main_paned.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
         self.main_paned.bind("<Configure>", self._on_paned_configure)
 
         # Files panel
@@ -1273,9 +1265,9 @@ class TkFrontend(tk.Tk):
         self.input_frame = input_frame
         self.input_text.focus()
 
-        # Status bar
-        self.status_bar = tk.Label(self, text="", bd=1, relief=tk.SUNKEN, anchor=tk.W)
-        self.status_bar.pack(fill=tk.X, padx=0, pady=0)
+        # Status bar (using grid to avoid geometry manager conflict)
+        self.status_bar = tk.Label(main_frame, text="", bd=1, relief=tk.SUNKEN, anchor=tk.W)
+        self.status_bar.grid(row=1, column=0, sticky="ew", padx=0, pady=0)
         self.font_updatable_widgets.append(self.status_bar)
 
     def _on_paned_configure(self, event):
@@ -1567,6 +1559,7 @@ class TkFrontend(tk.Tk):
             if self.queue_timer_id:
                 self.after_cancel(self.queue_timer_id)
             self.destroy()
+            sys.exit(1)
 
 
 def main_gui():
