@@ -685,11 +685,11 @@ if wx is not None:
         def _setup_panels(self):
             main_sizer = wx.BoxSizer(wx.VERTICAL)
     
-            self.splitter = wx.SplitterWindow(self)
+            self.splitter = wx.SplitterWindow(self,style=wx.SP_LIVE_UPDATE)
             self.splitter.SetMinimumPaneSize(self.files_min_lines * self.line_height)
             main_sizer.Add(self.splitter, 1, wx.EXPAND)
     
-            self.splitter1 = wx.SplitterWindow(self.splitter)
+            self.splitter1 = wx.SplitterWindow(self.splitter,style=wx.SP_LIVE_UPDATE)
             self.splitter1.SetMinimumPaneSize(self.files_min_lines * self.line_height)
     
             files_panel = wx.Panel(self.splitter1)
@@ -1602,14 +1602,14 @@ def main():
 
     if gui_toolkit == "wx":
         try:
-            from ashchat_wx import main_gui as main_gui_wx
+#           from ashchat_wx import main_gui as main_gui_wx
             main_gui_wx()
         except ImportError as e:
             print(f"Error: Could not import ashchat_wx module: {e}")
             sys.exit(1)
     else:
         try:
-            from ashchat_tk import main_gui as main_gui_tk
+#           from ashchat_tk import main_gui as main_gui_tk
             main_gui_tk()
         except ImportError as e:
             print(f"Error: Could not import ashchat_tk module: {e}")
