@@ -44,7 +44,7 @@ Clone the repository and install dependencies:
 ```bash
 python3 -m pip install google-genai openai boto3
 ```
-Ensure the `google-genai` package is installed for Gemini support, `openai` for Azure Gateway support, and `boto3` for AWS Bedrock support. Additional packages may be required for GUI frontends (e.g., `tkinter` for `ashchat_tk.py` or `wxPython` for `ashchat_wx.py`).
+Ensure the `google-genai` package is installed for Gemini support, `openai` for Azure Gateway support, and `boto3` for AWS Bedrock support. Additional packages may be required for GUI frontends (e.g., `tkinter` or `wxPython` for `ashchat.py`).
 
 ## API Key Configuration and Environment Variables
 Ash's behavior is configured via environment variables and site files within `ASH_DIR`. Variables are applied in the following precedence: 1) Internal defaults, 2) `site_defaults.txt`, 3) Explicit `ASH_*` user environment variables.
@@ -110,7 +110,7 @@ Below are example setups for both environments.
 
 ## Windows Setup (ash.bat)
 
-Copy `ash.py` into:
+Copy `eda_ai_assist.py` into:
 
 ```
 %USERPROFILE%\.ash
@@ -127,7 +127,7 @@ setx ASH_PROVIDER "gemini"
 setx ASH_MODEL "gemini-2.0-flash"
 
 REM Execute the assistant from the configured directory
-python "%USERPROFILE%\.ash\ash.py"
+python "%USERPROFILE%\.ash\eda_ai_assist.py"
 ```
 
 ---
@@ -143,7 +143,7 @@ export ASH_DIR="$HOME/.ash"
 export ASH_API_KEY="mykey123"
 export ASH_PROVIDER="gemini"
 export ASH_MODEL="gemini-2.0-flash"
-alias ash="$ASH_DIR/ash.py"
+alias ash="$ASH_DIR/eda_ai_assist.py"
 ```
 
 ### CSH / TCSH
@@ -153,12 +153,12 @@ setenv ASH_DIR "$HOME/.ash"
 setenv ASH_API_KEY "mykey123"
 setenv ASH_PROVIDER "gemini"
 setenv ASH_MODEL "gemini-2.0-flash"
-alias ash "$ASH_DIR/ash.py"
+alias ash "$ASH_DIR/eda_ai_assist.py"
 ```
 
 ### Make sure the script is executable:
 ```bash
-chmod +x $HOME/.ash/ash.py
+chmod +x $HOME/.ash/eda_ai_assist.py
 ```
 
 ## Usage
@@ -206,7 +206,7 @@ ash "analyze simulation1.vcd and find when in time the signal fault_int asserts.
 You can integrate Ash's AI capabilities into your Python programs.
 
 ```python
-from ash import api_eda_ai_assist
+from eda_ai_assist import api_eda_ai_assist
 
 ash = api_eda_ai_assist()
 ash.open_ai_session()
